@@ -1,0 +1,28 @@
+# ============================================================
+# 项目依赖配置文件 / Project Dependencies Configuration
+# ============================================================
+# 项目: 多部门文档自动合并系统 (MDDM)
+# Python 版本要求 / Python Version: >= 3.8
+# ============================================================
+
+# 核心依赖 / Core Dependencies
+lxml>=4.9.0
+Pillow>=9.0.0
+
+# 可选依赖 - OCR 功能 / Optional - OCR Functionality
+# pip install pix2tex latex2mathml
+
+# 可选依赖 - AI 文本校对 / Optional - AI Text Correction
+# pip install pycorrector
+
+# 可选依赖 - AI API 客户端 / Optional - AI API Clients
+# OpenAI / DeepSeek / Qwen: pip install openai
+# Google Gemini: pip install google-generativeai
+# Anthropic: pip install anthropic
+
+# ============================================================
+# 系统依赖说明 / System Dependencies
+# ============================================================
+# 1. Ruby + mathtype_to_mathml_plus (仅公式转换需要)
+#    gem install mathtype_to_mathml_plus
+# ============================================================
