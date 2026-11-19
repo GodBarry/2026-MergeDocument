@@ -39,6 +39,17 @@ pip install -r requirements.txt
 ```
 
 ### 2. 执行合并
+
+**桌面界面**
+
+```bash
+python merge_gui.py
+```
+
+在窗口中选择 Word 原稿、副本目录和合稿保存位置，然后点击「开始合并」。界面会显示运行日志，完成后可直接打开合稿、冲突报告和变更日志。桌面界面使用随 Windows 版 Python 提供的 Tkinter。若 Linux 环境缺少 Tkinter，可安装发行版提供的 Python Tk 软件包（如 Debian/Ubuntu 的 `python3-tk`）。
+
+**命令行**
+
 将所有部门的副本放入一个文件夹中，然后运行：
 ```bash
 python run_merge.py original_file.docx ./copies/ -o merged_output.docx
