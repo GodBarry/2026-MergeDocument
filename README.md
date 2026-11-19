@@ -4,7 +4,7 @@ MDDM 用于合并多个部门基于同一份 Word 原稿编辑的 DOCX 副本。
 
 ## 快速开始
 
-从 [工程部署包](releases/) 下载 ZIP 并完整解压。进入“Windows离线运行包”文件夹，先安装 Python 3.12 x64，启用 pip 和 Tcl/Tk，再双击“启动软件.cmd”。首次启动从包内 wheelhouse 安装程序和依赖。
+从 [工程部署包](https://github.com/GodBarry/2026-MergeDocument/tree/codex/word-merge-release-fixes/releases) 下载 ZIP 并完整解压。进入“Windows离线运行包”文件夹，先安装 Python 3.12 x64，启用 pip 和 Tcl/Tk，再双击“启动软件.cmd”。首次启动从包内 wheelhouse 安装程序和依赖。
 
 从源码部署时，可在项目目录执行：
 

@@ -12,6 +12,7 @@ from lxml import etree
 W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
 W14 = "{http://schemas.microsoft.com/office/word/2010/wordml}"
 W15 = "{http://schemas.microsoft.com/office/word/2012/wordml}"
+W16CID = "{http://schemas.microsoft.com/office/word/2016/wordml/cid}"
 REL = "{http://schemas.openxmlformats.org/package/2006/relationships}"
 CT = "{http://schemas.openxmlformats.org/package/2006/content-types}"
 SPACE = "{http://www.w3.org/XML/1998/namespace}space"
@@ -45,12 +46,19 @@ def _read_positions(body):
     return paragraphs, texts, anchors
 
 
-def _map_offset(old, new, offset):
+def _map_offset(old, new, offset, left_boundary):
     if old == new:
         return offset
-    for _, i, j, a, b in SequenceMatcher(None, old, new, autojunk=False).get_opcodes():
-        if i <= offset < j:
-            return a + min(offset - i, b - a)
+    # A range starts before its first selected character and ends immediately
+    # after its last. Edits outside either edge must stay outside the range.
+    character = offset if left_boundary else offset - 1
+    if character < 0:
+        return 0
+    for op, i, j, a, b in SequenceMatcher(None, old, new, autojunk=False).get_opcodes():
+        if i <= character < j:
+            if op == "equal":
+                return a + offset - i
+            return a + round((offset - i) * (b - a) / (j - i))
     return len(new)
 
 
@@ -101,6 +109,13 @@ def _identity(comment):
     return comment.get(W + "author"), comment.get(W + "date"), paragraphs
 
 
+def _anchor_key(tags, texts, para_ids):
+    return tuple(
+        (tag, para_ids[p] or p, texts[p], offset)
+        for tag, (p, offset) in sorted(tags.items())
+    )
+
+
 class WordComments:
     """Allocate one ID space for original, imported and generated comments."""
 
@@ -114,6 +129,8 @@ class WordComments:
         self.used_para_ids = set()
         self.new_para_id = 1
         original_ids = defaultdict(list)
+        by_durable, by_para, base_durables, original_anchors = {}, {}, {}, {}
+        versions = defaultdict(dict)
         for index, path in enumerate([original, *(path for path, _ in copies)], start=-1):
             mapping = {}
             if index >= 0:
@@ -129,37 +146,77 @@ class WordComments:
                 thread_ids = {}
                 imported_ids = set()
                 reused = set()
+                durables = {}
+                if "word/commentsIds.xml" in package.namelist():
+                    stable_ids = etree.fromstring(package.read("word/commentsIds.xml"))
+                    durables = {entry.get(W16CID + "paraId"): entry.get(W16CID + "durableId")
+                                for entry in stable_ids.findall(W16CID + "commentId")}
                 for comment in comments.findall(W + "comment"):
                     local = comment.get(ID)
                     identity = _identity(comment)
+                    comment_paras = list(comment.iter(W + "p"))
+                    last_para = comment_paras[-1].get(W14 + "paraId") if comment_paras else None
+                    durable = durables.get(last_para)
+                    anchor = _anchor_key(anchors.get(local, {}), texts, para_ids)
                     if index < 0:
                         self.originals[local] = comment
                         original_ids[identity].append(local)
+                        original_anchors[local] = anchor
+                        if last_para:
+                            by_para[last_para] = local
+                        if durable:
+                            by_durable[durable] = local
+                            base_durables[local] = durable
                         self.next_id = max(self.next_id, int(local) + 1)
                         mapping[local] = local
                         self.used_para_ids.update(p.get(W14 + "paraId") for p in comment.iter(W + "p"))
                         continue
-                    candidates = [cid for cid in original_ids[identity] if cid not in reused]
-                    base_id = local if local in candidates else None
-                    if base_id is None and len(candidates) == 1:
-                        base_id = candidates[0]
+                    base_id = by_durable.get(durable) or by_para.get(last_para)
+                    if durable and base_id in base_durables and base_durables[base_id] != durable:
+                        base_id = None
+                    if base_id is None:
+                        # Classic Word comments lack persistent IDs. A matching opinion
+                        # at another location is a different comment, even with the same local ID.
+                        candidates = [cid for cid in original_ids[identity] if cid not in reused
+                                      and not (last_para and any(p.get(W14 + "paraId")
+                                               for p in self.originals[cid].iter(W + "p")))
+                                      and anchor and original_anchors[cid] == anchor]
+                        base_id = local if local in candidates else None
+                        if base_id is None and len(candidates) == 1:
+                            base_id = candidates[0]
                     inherited = base_id is not None
+                    replace_base = False
+                    if inherited and _identity(self.originals[base_id]) != identity:
+                        previous = versions[base_id]
+                        if identity in previous:
+                            mapping[local] = previous[identity]
+                            continue
+                        replace_base = not previous
+                        inherited = replace_base
                     cid = base_id if inherited else str(self.next_id)
+                    if base_id is not None and _identity(self.originals[base_id]) != identity:
+                        versions[base_id][identity] = cid
                     mapping[local] = cid
                     if inherited:
                         reused.add(base_id)
                     else:
                         self.next_id += 1
+                    if not inherited or replace_base:
                         comment.set(ID, cid)
                         self.imports.append((path, comment))
-                    for p_index, paragraph in enumerate(comment.iter(W + "p")):
+                    for p_index, paragraph in enumerate(comment_paras):
                         old = paragraph.get(W14 + "paraId")
                         if old is None:
                             continue
                         if inherited:
                             base_paras = list(self.originals[base_id].iter(W + "p"))
-                            if p_index < len(base_paras):
+                            # Word identifies a thread by the final paragraph in its comment.
+                            if p_index == len(comment_paras) - 1:
+                                thread_ids[old] = base_paras[-1].get(W14 + "paraId", old)
+                            elif p_index < len(base_paras) - 1:
                                 thread_ids[old] = base_paras[p_index].get(W14 + "paraId", old)
+                            if replace_base and old in thread_ids:
+                                paragraph.set(W14 + "paraId", thread_ids[old])
                             continue
                         new = old
                         while new in self.used_para_ids:
@@ -221,7 +278,7 @@ class WordComments:
                 candidates = by_para_id.get(para_ids[index], []) if para_ids[index] else []
                 if candidates:
                     target = min(candidates, key=lambda n: (target_texts[n] != texts[index], abs(n - target)))
-                new_offset = _map_offset(texts[index], target_texts[target], offset)
+                new_offset = _map_offset(texts[index], target_texts[target], offset, tag == W + "commentRangeStart")
                 _insert_marker(paragraphs[target], new_offset, etree.Element(tag, {ID: cid}))
                 placed.add((cid, tag))
 
@@ -231,9 +288,14 @@ class WordComments:
         directory = Path(extract_dir) / "word"
         path = directory / "comments.xml"
         root = etree.parse(str(path)).getroot() if path.exists() else etree.Element(W + "comments", nsmap={"w": W[1:-1]})
+        existing = {c.get(ID): c for c in root.findall(W + "comment")}
         for source, comment in self.imports:
             clone_resources(comment, source, extract_dir, owner="comments.xml")
-            root.append(comment)
+            old = existing.get(comment.get(ID))
+            if old is None:
+                root.append(comment)
+            else:
+                root.replace(old, comment)
         _part_write(path, root)
         if not self.thread_entries:
             return

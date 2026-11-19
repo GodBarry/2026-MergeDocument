@@ -40,9 +40,11 @@ def review_doc(path, blocks, comments):
                      Target="comments.xml")
     parts["word/_rels/document.xml.rels"] = etree.tostring(relations)
     root = etree.Element(W + "comments", nsmap={"w": WORD_NS})
-    for cid, author, text in comments:
+    for cid, author, text, *stable in comments:
         c = etree.SubElement(root, W + "comment", {W + "id": cid, W + "author": author})
         paragraph = etree.SubElement(c, W + "p")
+        if stable:
+            paragraph.set("{http://schemas.microsoft.com/office/word/2010/wordml}paraId", stable[0])
         run = etree.SubElement(paragraph, W + "r")
         etree.SubElement(run, W + "t").text = text
     parts["word/comments.xml"] = etree.tostring(root)
@@ -74,6 +76,43 @@ class OriginalCommentsTests(unittest.TestCase):
             ids = Counter(n.get(W + "id") for n in body.iter(W + tag))
             self.assertEqual(ids, Counter(by_id.keys()))
         return body, by_id
+
+    def test_renumbered_identical_review_on_second_anchor_keeps_both_positions(self):
+        old = ("0", "QA", "Please confirm", "10000A00")
+        review_doc(self.base, [reviewed_paragraph("Alpha", None), reviewed_paragraph("Bravo", "0")], [old])
+        review_doc(self.copies / "a.docx", [reviewed_paragraph("Alpha", "0"), reviewed_paragraph("Bravo", "1")],
+                   [("0", "QA", "Please confirm", "10000B00"), ("1", *old[1:])])
+        body, comments = self.merged()
+        self.assertEqual(len(comments), 2)
+        self.assertEqual([len(list(p.iter(W + "commentReference"))) for p in body.iter(W + "p")], [1, 1])
+
+    def test_single_updated_opinion_replaces_original_and_distinct_submissions_are_kept(self):
+        base = ("0", "QA", "Original opinion", "10000A00")
+        block = reviewed_paragraph("Budget.", "0")
+        review_doc(self.base, [block], [base])
+        review_doc(self.copies / "a.docx", [block], [(base[0], base[1], "Opinion A", base[3])])
+        _, comments = self.merged()
+        self.assertCountEqual(comments.values(), [("QA", "Opinion A")])
+        review_doc(self.copies / "b.docx", [block], [(base[0], base[1], "Opinion B", base[3])])
+        _, comments = self.merged()
+        self.assertCountEqual(comments.values(), [("QA", "Opinion A"), ("QA", "Opinion B")])
+
+    def test_other_reviewers_prefix_and_suffix_remain_outside_comment_selection(self):
+        old = "Payment total: 100"
+        review_doc(self.base, [reviewed_paragraph(old, None)], [])
+        selected = reviewed_paragraph("100", "0").replace("<w:p>", "<w:p><w:r><w:t>Payment total: </w:t></w:r>")
+        review_doc(self.copies / "a.docx", [selected], [("0", "QA", "Check this amount")])
+        review_doc(self.copies / "b.docx", [reviewed_paragraph("Final " + old + " plus charges", None)], [])
+        body, comments = self.merged()
+        cid = next(k for k, (author, _) in comments.items() if author == "QA")
+        active = False
+        selected = []
+        for node in body.iter():
+            if node.get(W + "id") == cid and node.tag in (W + "commentRangeStart", W + "commentRangeEnd"):
+                active = node.tag == W + "commentRangeStart"
+            elif active and node.tag == W + "t":
+                selected.append(node.text)
+        self.assertEqual("".join(selected), "100")
 
     def test_two_reviewers_on_unchanged_paragraph_keep_separate_overlapping_ranges(self):
         review_doc(self.base, [reviewed_paragraph("Please review July budget.", None)], [])
