@@ -6,7 +6,9 @@
 import os
 import sys
 import json
+import posixpath
 import re
+from itertools import combinations, groupby
 import difflib
 import hashlib
 import shutil
@@ -96,6 +98,7 @@ WP  = 'http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing'
 A   = 'http://schemas.openxmlformats.org/drawingml/2006/main'
 R   = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
 REL = 'http://schemas.openxmlformats.org/package/2006/relationships'
+CT_NS = 'http://schemas.openxmlformats.org/package/2006/content-types'
 COMMENTS_NS = 'http://schemas.microsoft.com/office/word/2010/wordml'
 
 _AUTHOR_COLORS = [
@@ -189,6 +192,13 @@ class DocItem:
         self.detected_level: int = 0   # 推断级别 (0=正文, 1=1级...)
         self.body_tag: str = ''   # body 子元素标签名
 
+    def table_shape(self) -> tuple:
+        return tuple(tuple((cell['rowspan'], cell['colspan']) for cell in row) for row in self.rows)
+
+    def table_diff_key(self) -> tuple:
+        cell_text = tuple(tuple(cell['text'] for cell in row) for row in self.rows)
+        return self.table_shape(), cell_text
+
     def __repr__(self):
         return f"<DocItem {self.type} #{self.index}: {self.content[:30]!r}>"
 
@@ -220,15 +230,21 @@ class OpenXMLDocumentEngine:
             style_map = self._load_styles(doc_path)
 
             with zipfile.ZipFile(doc_path) as zf:
-                if 'word/document.xml' not in zf.namelist():
-                    print(f"    [!] 文档中无 document.xml: {doc_path}")
-                    return {'items': [], 'item_count': 0}
+                required_parts = {'[Content_Types].xml', '_rels/.rels', 'word/document.xml'}
+                missing = required_parts.difference(zf.namelist())
+                if missing:
+                    raise ValueError(f"缺少 DOCX 部件: {', '.join(sorted(missing))}")
+
+                if _safe_xml_from_zip(zf, '[Content_Types].xml').tag != f'{{{CT_NS}}}Types':
+                    raise ValueError("缺少有效的 DOCX 内容类型表")
+                if _safe_xml_from_zip(zf, '_rels/.rels').tag != f'{{{REL}}}Relationships':
+                    raise ValueError("缺少有效的 DOCX 包关系表")
 
                 doc_root = _safe_xml_from_zip(zf, 'word/document.xml')
                 body = doc_root.find(_wtag('body'))
 
-            if body is None:
-                return {'items': [], 'item_count': 0}
+            if doc_root.tag != _wtag('document') or body is None:
+                raise ValueError("缺少有效的 Word 正文")
 
             print(f"    正在分析文档...")
 
@@ -320,11 +336,8 @@ class OpenXMLDocumentEngine:
                 '_table_count': table_counter,
             }
 
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            print(f"  [WARN] 提取失败: {e}")
-            return {'items': [], 'item_count': 0}
+        except Exception as error:
+            raise ValueError(f"无法读取 DOCX {doc_path}: {error}") from error
 
     # ------------------------------------------------------------------
     # 段落提取
@@ -627,13 +640,12 @@ class OpenXMLDocumentEngine:
             row = []
             for tc in tr.findall(_wtag('tc')):
                 tcPr = tc.find(_wtag('tcPr'))
-                vMerge = 0
+                vMerge = None
                 hMerge = 1
                 if tcPr is not None:
                     vm = tcPr.find(_wtag('vMerge'))
                     if vm is not None:
-                        val = vm.get(_wtag('val'))
-                        vMerge = 1 if (val is None or val != '0') else 0
+                        vMerge = vm.get(_wtag('val'), 'continue')
                     hm = tcPr.find(_wtag('gridSpan'))
                     if hm is not None:
                         hMerge = int(hm.get(_wtag('val'), 1))
@@ -767,9 +779,18 @@ class OpenXMLDocumentEngine:
         print(f"    [合并] 使用纯 XML 引擎合并...")
         self._replaced_positions = set()
 
-        # 复制原稿到输出路径
-        os.makedirs(os.path.dirname(output) or '.', exist_ok=True)
-        shutil.copy2(base_doc, output)
+        if os.path.exists(output):
+            input_paths = [base_doc, *(path for path, _ in copies)]
+            if any(os.path.samefile(path, output) for path in input_paths):
+                raise ValueError(f"输出文件不能覆盖输入文档: {output}")
+
+        output_dir = os.path.dirname(output) or '.'
+        os.makedirs(output_dir, exist_ok=True)
+        conflict_ids = {
+            change.change_id
+            for group in (conflicting_changes_by_para or {}).values()
+            for change in group
+        }
 
         # 建立副本颜色映射（使用 copy_index 保证唯一性）
         copy_colors: Dict[int, str] = {}
@@ -787,7 +808,7 @@ class OpenXMLDocumentEngine:
         # 解压 docx
         extract_dir = tempfile.mkdtemp(prefix='docx_merge_')
         try:
-            with zipfile.ZipFile(output, 'r') as zf:
+            with zipfile.ZipFile(base_doc, 'r') as zf:
                 zf.extractall(extract_dir)
 
             doc_xml_path = os.path.join(extract_dir, 'word', 'document.xml')
@@ -840,14 +861,13 @@ class OpenXMLDocumentEngine:
             if changes:
                 # 预处理：标记连续变更以减少重复生成批注气泡
                 # 注意：只在完全相同位置时才跳过批注，保留每个不同位置变更的批注
-                last_pos_by_author = {}
+                last_pos_by_copy = {}
                 for change in changes:
                     change._skip_comment = False
                     pos = getattr(change, 'true_block_index', change.position)
-                    author = change.author
                     ctype = change.change_type
 
-                    last_info = last_pos_by_author.get(author)
+                    last_info = last_pos_by_copy.get(change.copy_index)
                     if last_info:
                         last_pos, last_ctype = last_info
                         # 只有在同一位置、同一类型时，才跳过批注
@@ -855,7 +875,7 @@ class OpenXMLDocumentEngine:
                         if pos == last_pos and ctype == last_ctype:
                             change._skip_comment = True
 
-                    last_pos_by_author[author] = (pos, ctype)
+                    last_pos_by_copy[change.copy_index] = (pos, ctype)
 
                 for change in changes:
                     # 优先使用 true_block_index（已在 _write_changes 中计算），否则用 position
@@ -867,13 +887,17 @@ class OpenXMLDocumentEngine:
                     skip_comment = getattr(change, '_skip_comment', False)
 
                     # 不由于新增或删除而重建 blocks，保持块指针长期有效
-                    copy_path = copies[copy_idx][0] if copy_idx < len(copies) else None
+                    copy_path = copies[copy_idx][0] if 0 <= copy_idx < len(copies) else None
+                    is_conflict = change.change_id in conflict_ids
 
                     if ctype == 'delete' or ctype.endswith('_delete'):
                         self._apply_delete(body, blocks, pos, change, author, color, get_comment_id, skip_comment)
+                        if is_conflict:
+                            self._replaced_positions.add(pos)
 
                     elif ctype in ('modify', 'table', 'image'):
-                        self._apply_modify(body, blocks, pos, change, author, color, get_comment_id, extract_dir, copy_path, skip_comment)
+                        self._apply_modify(body, blocks, pos, change, author, color, get_comment_id,
+                                           extract_dir, copy_path, skip_comment, is_conflict)
 
                     elif ctype == 'insert' or ctype.endswith('_insert'):
                         self._apply_insert(body, blocks, pos, change, author, color, get_comment_id, extract_dir, copy_path, skip_comment)
@@ -888,8 +912,15 @@ class OpenXMLDocumentEngine:
             if self.copy_comment_ids:
                 self._update_comments_xml(extract_dir, self.copy_comment_ids, copy_colors)
 
-            # 重新打包为 docx
-            self._repack_docx(extract_dir, output)
+            # 先在输出目录生成完整文件，再替换目标，避免留下半写入的合稿。
+            with tempfile.NamedTemporaryFile(dir=output_dir, suffix='.tmp', delete=False) as staged:
+                staged_path = staged.name
+            try:
+                self._repack_docx(extract_dir, staged_path)
+                os.replace(staged_path, output)
+            finally:
+                if os.path.exists(staged_path):
+                    os.unlink(staged_path)
             print(f"    [合并] 完成: {output}")
 
         finally:
@@ -945,7 +976,8 @@ class OpenXMLDocumentEngine:
                        pos: int,
                        change: DocumentChange,
                        author: str, color: str,
-                       get_cid_fn, extract_dir: str = None, copy_path: str = None, skip_comment: bool = False) -> None:
+                       get_cid_fn, extract_dir: str = None, copy_path: str = None,
+                       skip_comment: bool = False, is_conflict: bool = False) -> None:
         """修改/替换指定位置的块"""
         if pos < 0 or pos >= len(blocks):
             print(f"      [MOD] 跳过: position={pos} 超出范围")
@@ -954,7 +986,8 @@ class OpenXMLDocumentEngine:
         ctype = change.change_type
 
         if ctype == 'table':
-            self._apply_table_diff(body, blocks, pos, change, author, color, get_cid_fn, skip_comment)
+            self._apply_table_diff(body, blocks, pos, change, author, color, get_cid_fn,
+                                   extract_dir, copy_path, skip_comment, is_conflict)
         else:
             # 段落修改
             self._apply_para_modify(body, blocks, pos, change, author, color, get_cid_fn, extract_dir, copy_path, skip_comment)
@@ -1049,7 +1082,7 @@ class OpenXMLDocumentEngine:
         if is_already_replaced:
             # 插入并列保留提示
             warn_para = self._make_comment_para(
-                f"[冲突警告: 因另一副本也在此处修改，{author} 的修改被并列保留]", "FF9900", cid if cid else get_cid_fn(copy_idx, author, "冲突并列")
+                f"[冲突警告: 此处存在多个副本的变更，{author} 的修改被并列保留]", "FF9900"
             )
             body.insert(blk_idx + 1, warn_para)
             body.insert(blk_idx + 2, new_para)
@@ -1280,17 +1313,34 @@ class OpenXMLDocumentEngine:
                            pos: int,
                            change: DocumentChange,
                            author: str, color: str,
-                           get_cid_fn, skip_comment: bool = False) -> None:
-        """将表格中有差异的单元格标色"""
+                           get_cid_fn, extract_dir: str = None, copy_path: str = None,
+                           skip_comment: bool = False, is_conflict: bool = False) -> None:
+        """合并表格单元格变更，保留结构变更和冲突副本。"""
         if pos < 0 or pos >= len(blocks):
             return
         tbl_el = blocks[pos]
         if tbl_el.tag != _wtag('tbl'):
             return
 
-        try:
-            diff_cells = json.loads(change.content)
-        except Exception:
+        fmt = change.format_info or {}
+        diff_cells = json.loads(change.content)
+        copy_table_xml = fmt.get('copy_tbl_xml')
+        if copy_table_xml and (fmt.get('structure_changed') or is_conflict):
+            copy_table = etree.fromstring(copy_table_xml.encode('utf-8'))
+            if extract_dir and copy_path:
+                self._clone_relationships_and_media(copy_table, copy_path, extract_dir)
+
+            label = '表格变更冲突，副本待复核' if is_conflict else '修改表格结构'
+            first_p = copy_table.find('.//' + _wtag('p'))
+            if first_p is not None and not skip_comment:
+                cid = get_cid_fn(change.copy_index, author, f"[{author} {label}]")
+                self._add_comment_to_element(first_p, cid, author)
+
+            if is_conflict:
+                tbl_el.addnext(copy_table)
+            else:
+                body.replace(tbl_el, copy_table)
+                blocks[pos] = copy_table
             return
 
         for diff in diff_cells:
@@ -1362,33 +1412,36 @@ class OpenXMLDocumentEngine:
         try:
             with zipfile.ZipFile(copy_path, 'r') as source_zf:
                 if 'word/_rels/document.xml.rels' not in source_zf.namelist():
-                    return
+                    raise ValueError("副本缺少正文的资源关系表")
                 with source_zf.open('word/_rels/document.xml.rels') as f:
                     source_rels_root = etree.parse(f).getroot()
 
-                source_ct_root = None
-                if '[Content_Types].xml' in source_zf.namelist():
-                    with source_zf.open('[Content_Types].xml') as f:
-                        source_ct_root = etree.parse(f).getroot()
-                
+                with source_zf.open('[Content_Types].xml') as f:
+                    source_ct_root = etree.parse(f).getroot()
+
                 target_rels_path = os.path.join(extract_dir, 'word', '_rels', 'document.xml.rels')
-                if not os.path.exists(target_rels_path):
-                    return
-                target_rels_tree = etree.parse(target_rels_path)
+                if os.path.exists(target_rels_path):
+                    target_rels_tree = etree.parse(target_rels_path)
+                else:
+                    os.makedirs(os.path.dirname(target_rels_path), exist_ok=True)
+                    target_rels_tree = etree.ElementTree(etree.Element(f'{{{REL}}}Relationships'))
                 target_rels_root = target_rels_tree.getroot()
 
                 target_ct_path = os.path.join(extract_dir, '[Content_Types].xml')
-                target_ct_tree = None
-                target_ct_root = None
-                if os.path.exists(target_ct_path):
-                    target_ct_tree = etree.parse(target_ct_path)
-                    target_ct_root = target_ct_tree.getroot()
+                target_ct_tree = etree.parse(target_ct_path)
+                target_ct_root = target_ct_tree.getroot()
                 
-                R_NS = 'http://schemas.openxmlformats.org/package/2006/relationships'
-                CT_NS = 'http://schemas.openxmlformats.org/package/2006/content-types'
-                r_tag = lambda n: f'{{{R_NS}}}{n}'
+                r_tag = lambda n: f'{{{REL}}}{n}'
                 ct_tag = lambda n: f'{{{CT_NS}}}{n}'
-                
+                source_overrides = {
+                    part.get('PartName'): part.get('ContentType')
+                    for part in source_ct_root.findall(ct_tag('Override'))
+                }
+                source_defaults = {
+                    part.get('Extension', '').lower(): part.get('ContentType')
+                    for part in source_ct_root.findall(ct_tag('Default'))
+                }
+
                 # 💡 核心改进：在多副本场景下，由于多次打开/写入 rels 文件，
                 # 必须确保基于当前文件内容重新扫描 ID，防止多副本 ID 竞争冲突。
                 existing_ids = [el.get('Id', '') for el in target_rels_root]
@@ -1434,47 +1487,36 @@ class OpenXMLDocumentEngine:
                     if target_mode == 'External':
                         new_rel.set('Target', target_path_relative)
                     else:
-                        source_item_path = f"word/{target_path_relative}"
-                        filename = os.path.basename(target_path_relative)
-                        dirname = os.path.dirname(target_path_relative)
-                        new_filename = f"{new_rid}_{filename}"
-                        new_target_path = os.path.join(dirname, new_filename).replace('\\', '/')
+                        source_part = posixpath.normpath(posixpath.join('/word', target_path_relative))
+                        source_item_path = source_part.lstrip('/')
+                        dirname, filename = posixpath.split(source_part)
+                        new_part = posixpath.join(dirname, f"{new_rid}_{filename}")
+                        dest_path = os.path.abspath(os.path.join(extract_dir, *new_part.lstrip('/').split('/')))
+                        if os.path.commonpath((extract_dir, dest_path)) != extract_dir:
+                            raise ValueError("DOCX 资源路径超出合稿目录")
+                        os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+                        new_rel.set('Target', posixpath.relpath(new_part, '/word'))
                         
-                        full_dest_dir = os.path.join(extract_dir, 'word', dirname)
-                        os.makedirs(full_dest_dir, exist_ok=True)
-                        full_dest_path = os.path.join(extract_dir, 'word', new_target_path)
-                        
-                        new_rel.set('Target', new_target_path)
-                        
-                        try:
-                            if source_item_path in source_zf.namelist():
-                                with source_zf.open(source_item_path) as sf, open(full_dest_path, 'wb') as df:
-                                    shutil.copyfileobj(sf, df)
-                        except Exception as e:
-                            print(f"      [WARN] 复制内嵌媒体失败 {source_item_path}: {e}")
+                        with source_zf.open(source_item_path) as source, open(dest_path, 'wb') as target:
+                            shutil.copyfileobj(source, target)
 
-                        if source_ct_root is not None and target_ct_root is not None:
-                            old_part_name = f"/word/{target_path_relative}"
-                            new_part_name = f"/word/{new_target_path}"
-                            for ov in source_ct_root.findall(ct_tag('Override')):
-                                if ov.get('PartName') == old_part_name:
-                                    has_override = any(t_ov.get('PartName') == new_part_name for t_ov in target_ct_root.findall(ct_tag('Override')))
-                                    if not has_override:
-                                        new_ov = etree.SubElement(target_ct_root, ct_tag('Override'))
-                                        new_ov.set('PartName', new_part_name)
-                                        new_ov.set('ContentType', ov.get('ContentType', ''))
-                                    break
-                    
+                        extension = os.path.splitext(filename)[1].lstrip('.').lower()
+                        content_type = source_overrides.get(f"/{source_item_path}") or source_defaults.get(extension)
+                        if not content_type:
+                            raise ValueError(f"资源缺少内容类型: {source_item_path}")
+                        etree.SubElement(target_ct_root, ct_tag('Override'),
+                                         PartName=new_part, ContentType=content_type)
+
                     rid_map[old_rid] = new_rid
                     node.set(attr_name, new_rid)
                 
                 if rid_map:
                     target_rels_tree.write(target_rels_path, xml_declaration=True, encoding='UTF-8', standalone=True)
-                if rid_map and target_ct_tree is not None:
+                if rid_map:
                     target_ct_tree.write(target_ct_path, xml_declaration=True, encoding='UTF-8', standalone=True)
                      
         except Exception as e:
-            print(f"    [WARN] 内嵌资源重定向失败: {e}")
+            raise ValueError(f"无法从 {copy_path} 复制内嵌资源: {e}") from e
 
     def _ensure_table_borders(self, tbl: etree._Element) -> None:
         """确保表格具有完整的实线边框（单边 0.5pt 黑色）
@@ -1542,12 +1584,9 @@ class OpenXMLDocumentEngine:
         new_parsed_el = None
         
         if xml_str:
-            try:
-                new_parsed_el = etree.fromstring(xml_str.encode('utf-8'))
-                if extract_dir and copy_path:
-                    self._clone_relationships_and_media(new_parsed_el, copy_path, extract_dir)
-            except Exception:
-                new_parsed_el = None
+            new_parsed_el = etree.fromstring(xml_str.encode('utf-8'))
+            if extract_dir and copy_path:
+                self._clone_relationships_and_media(new_parsed_el, copy_path, extract_dir)
 
         if new_parsed_el is not None and new_parsed_el.tag == _wtag('tbl'):
             new_tbl = new_parsed_el
@@ -1658,15 +1697,9 @@ class OpenXMLDocumentEngine:
         return para
 
     def _make_comment_para(self, text: str, color: str,
-                            comment_id: str) -> etree._Element:
-        """创建一个带批注的说明段落，text 包含完整文本（含作者+操作类型+内容）"""
+                            comment_id: str = None) -> etree._Element:
+        """创建说明段落，按需附加批注引用。"""
         para = etree.Element(_wtag('p'))
-        # 背景色
-        rPr = etree.SubElement(para, _wtag('rPr'))
-        shd = etree.SubElement(rPr, _wtag('shd'))
-        shd.set(_wtag('val'), 'clear')
-        shd.set(_wtag('color'), 'auto')
-        shd.set(_wtag('fill'), color + '33')  # 半透明
 
         r = etree.SubElement(para, _wtag('r'))
         rPr2 = etree.SubElement(r, _wtag('rPr'))
@@ -1677,10 +1710,10 @@ class OpenXMLDocumentEngine:
         t.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
         t.text = text
 
-        # 批注引用必须在 w:r 下，绝不能在 w:rPr 下
-        crr = etree.SubElement(para, _wtag('r'))
-        cr = etree.SubElement(crr, _wtag('commentReference'))
-        cr.set(_wtag('id'), str(comment_id))
+        if comment_id is not None:
+            crr = etree.SubElement(para, _wtag('r'))
+            cr = etree.SubElement(crr, _wtag('commentReference'))
+            cr.set(_wtag('id'), str(comment_id))
         return para
 
     def _add_comment_to_element(self, elem: etree._Element,
@@ -1787,7 +1820,6 @@ class OpenXMLDocumentEngine:
         if os.path.exists(ct_path):
             ct_tree = etree.parse(ct_path)
             ct_root = ct_tree.getroot()
-            CT_NS = 'http://schemas.openxmlformats.org/package/2006/content-types'
             ct_tag = lambda n: f'{{{CT_NS}}}{n}'
             overrides = ct_root.findall(ct_tag('Override'))
             has_comments = any(
@@ -1806,26 +1838,29 @@ class OpenXMLDocumentEngine:
         rels_path = os.path.join(extract_dir, 'word', '_rels', 'document.xml.rels')
         if os.path.exists(rels_path):
             r_tree = etree.parse(rels_path)
-            r_root = r_tree.getroot()
-            R_NS = REL
-            r_tag = lambda n: f'{{{R_NS}}}{n}'
-            existing_ids = [el.get('Id', '') for el in r_root]
-            next_rid = max(
-                (int(i[3:]) for i in existing_ids if i.startswith('rId') and i[3:].isdigit()),
-                default=1) + 1
+        else:
+            os.makedirs(os.path.dirname(rels_path), exist_ok=True)
+            r_tree = etree.ElementTree(etree.Element(f'{{{REL}}}Relationships'))
+        r_root = r_tree.getroot()
+        R_NS = REL
+        r_tag = lambda n: f'{{{R_NS}}}{n}'
+        existing_ids = [el.get('Id', '') for el in r_root]
+        next_rid = max(
+            (int(i[3:]) for i in existing_ids if i.startswith('rId') and i[3:].isdigit()),
+            default=1) + 1
 
-            has_comments = any(
-                el.get('Type', '').endswith('comments')
-                for el in r_root)
-            if not has_comments:
-                rel = etree.SubElement(r_root, r_tag('Relationship'))
-                rel.set('Id', f'rId{next_rid}')
-                rel.set('Type',
-                        'http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments')
-                rel.set('Target', 'comments.xml')
-                r_tree2 = etree.ElementTree(r_root)
-                r_tree2.write(rels_path, xml_declaration=True,
-                              encoding='UTF-8', standalone=True)
+        has_comments = any(
+            el.get('Type', '').endswith('comments')
+            for el in r_root)
+        if not has_comments:
+            rel = etree.SubElement(r_root, r_tag('Relationship'))
+            rel.set('Id', f'rId{next_rid}')
+            rel.set('Type',
+                    'http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments')
+            rel.set('Target', 'comments.xml')
+            r_tree2 = etree.ElementTree(r_root)
+            r_tree2.write(rels_path, xml_declaration=True,
+                          encoding='UTF-8', standalone=True)
 
     def _repack_docx(self, extract_dir: str, output_path: str) -> None:
         """将解压后的目录重新打包为 docx"""
@@ -2202,12 +2237,13 @@ class MultiCopyMerger:
 
         # 5. 写回操作（包含冲突检测）
         print("\n[5/5] 写回操作...")
-        auto_merged_count = self._write_changes(output_path)
+        written_count = self._write_changes(output_path)
+        conflict_count = sum(len(conflict.changes) for conflict in self.conflicts)
 
         # 6. 生成冲突报告
         print("\n[6/6] 生成冲突报告...")
         if conflict_report_path is None:
-            conflict_report_path = output_path.replace('.docx', '_conflicts.html')
+            conflict_report_path = os.path.splitext(output_path)[0] + '_conflicts.html'
         
         self._generate_conflict_report(conflict_report_path)
         
@@ -2215,7 +2251,7 @@ class MultiCopyMerger:
         result = MergeResult(
             merged_document=output_path,
             conflicts=self.conflicts,
-            auto_merged_count=auto_merged_count,
+            auto_merged_count=written_count - conflict_count,
             manual_review_count=len(self.conflicts),
             conflict_report=conflict_report_path
         )
@@ -2224,6 +2260,10 @@ class MultiCopyMerger:
 
     def _disassemble_documents(self):
         """拆解文档：提取原稿和所有副本的结构"""
+        self.original_structure = self.builder.extract_document_structure(self.original_doc)
+        self.orig_items = self.original_structure['items']
+        print(f"    ✓ 原稿解析完成: {len(self.orig_items)} 个块", flush=True)
+        self.copy_items_list.clear()
         for i, (copy_path, author) in enumerate(self.copies):
             print(f"  [{i+1}/{len(self.copies)}] 解析 {author} 的副本...")
             print(f"    正在解析文档结构: {os.path.basename(copy_path)}...", flush=True)
@@ -2235,14 +2275,6 @@ class MultiCopyMerger:
 
             # 缓存副本 items
             self.copy_items_list.append(copy_items)
-
-            # 确保原稿已解析
-            if not self.original_structure.get('items'):
-                self.original_structure = self.builder.extract_document_structure(self.original_doc)
-                self.orig_items = self.original_structure.get('items', [])
-                print(f"    ✓ 原稿解析完成: {len(self.orig_items)} 个块")
-            elif not self.orig_items:
-                self.orig_items = self.original_structure.get('items', [])
 
     def _detect_all_headings(self):
         """标题识别：根据提取逻辑正式提取原稿和所有副本锚点，并仅作打印展示"""
@@ -2259,6 +2291,9 @@ class MultiCopyMerger:
 
     def _match_all_headings(self):
         """标题配对：复用已提取的锚点并严格执行交叉配对，仅进行结果打印"""
+        self.anchor_pairs_list.clear()
+        self.orphan_orig_list.clear()
+        self.orphan_copy_list.clear()
         for i, (copy_path, author) in enumerate(self.copies):
             copy_anchors = self.copy_anchors_list[i]
 
@@ -2283,6 +2318,7 @@ class MultiCopyMerger:
 
     def _detect_all_changes(self):
         """diff 检测：提取所有副本相对于原稿的变更"""
+        self.changes_by_author.clear()
         for i, (copy_path, author) in enumerate(self.copies):
             print(f"  [{i+1}/{len(self.copies)}] diff 检测 {author} 的副本...")
             self._extract_changes(author, i)
@@ -2598,7 +2634,8 @@ class MultiCopyMerger:
         orig_items = self.original_structure.get('items', [])
 
         def item_key(item):
-            return (item.type, item.content)
+            content = item.table_diff_key() if item.type == 'table' else item.content
+            return (item.type, content)
 
         class _ItemWrapper:
             __slots__ = ('orig', 'sort_key')
@@ -3202,6 +3239,8 @@ class MultiCopyMerger:
         # 改进的 item key：空内容按位置匹配，有内容按内容匹配
         def item_key(item: DocItem, offset: int) -> tuple:
             """返回匹配 key：(has_content, type, content/key)"""
+            if item.type == 'table':
+                return (1, item.type, item.table_diff_key())
             content = item.content.strip() if item.content else ""
             if content:
                 return (1, item.type, content)  # 有内容：优先按内容匹配
@@ -3364,7 +3403,7 @@ class MultiCopyMerger:
     def _make_delete_change(self, item: DocItem, author: str, copy_index: int) -> List[DocumentChange]:
         """生成删除变更"""
         return [DocumentChange(
-            change_id=f"{author}_del_{item.index}",
+            change_id=f"{author}_{copy_index}_del_{item.index}",
             change_type=f'{item.type}_delete' if item.type != 'paragraph' else 'delete',
             position=item.index,
             content=item.content,
@@ -3393,7 +3432,7 @@ class MultiCopyMerger:
         #     format_info['actual_level'] = item.detected_level
 
         return [DocumentChange(
-            change_id=f"{author}_ins_{item.index}",
+            change_id=f"{author}_{copy_index}_ins_{item.index}",
             change_type=f'{item.type}_insert' if item.type != 'paragraph' else 'insert',
             position=position,
             content=item.content,
@@ -3449,7 +3488,7 @@ class MultiCopyMerger:
             #     annotation['format_info']['actual_level'] = c_item.detected_level
 
             changes.append(DocumentChange(
-                change_id=f"{author}_mod_{o_item.index}",
+                change_id=f"{author}_{copy_index}_mod_{o_item.index}",
                 change_type='modify',
                 position=o_item.index,
                 content=json.dumps(annotation, ensure_ascii=False),
@@ -3465,8 +3504,14 @@ class MultiCopyMerger:
         elif o_item.type == 'table' and c_item.type == 'table':
             # 表格单元格 diff
             diff_cells = self._diff_table_cells(o_item.rows, c_item.rows)
+            format_info = {
+                'item_type': 'table',
+                'diff_cells': diff_cells,
+                'structure_changed': o_item.table_shape() != c_item.table_shape(),
+                'copy_tbl_xml': etree.tostring(c_item.xml, encoding='unicode'),
+            }
             changes.append(DocumentChange(
-                change_id=f"{author}_tbl_{o_item.index}",
+                change_id=f"{author}_{copy_index}_tbl_{o_item.index}",
                 change_type='table',
                 position=o_item.index,
                 content=json.dumps(diff_cells, ensure_ascii=False),
@@ -3476,12 +3521,12 @@ class MultiCopyMerger:
                 page_number=o_item.page,
                 paragraph_index=o_item.index,
                 para_order=o_item.index,
-                format_info={'item_type': 'table', 'diff_cells': diff_cells},
+                format_info=format_info,
             ))
 
         elif o_item.type == 'image':
             changes.append(DocumentChange(
-                change_id=f"{author}_img_mod_{o_item.index}",
+                change_id=f"{author}_{copy_index}_img_mod_{o_item.index}",
                 change_type='image',
                 position=o_item.index,
                 content=f"图片被替换: {o_item.item_id} → {c_item.item_id}",
@@ -3840,69 +3885,53 @@ class MultiCopyMerger:
             if hasattr(item, 'page') and item.page:
                 return item.page
         return (item_index // 30) + 1
-    def _is_conflict(self, change1: DocumentChange, change2: DocumentChange) -> bool:
-        """判断两个变更是否冲突"""
-        # 同一副本的变更不冲突（取后一个版本）
-        if change1.copy_index == change2.copy_index:
+    def _is_conflict(self, first: DocumentChange, second: DocumentChange) -> bool:
+        if first.copy_index == second.copy_index or first.position != second.position:
+            return False
+        if any(change.change_type.endswith('insert') for change in (first, second)):
+            return False
+        if all(change.change_type.endswith('delete') for change in (first, second)):
             return False
 
-        # 检查位置是否相同
-        if change1.position == change2.position:
-            return False
-
-        # 如果都是插入且位置相同，不算冲突
-        if change1.change_type == 'insert' and change2.change_type == 'insert':
-            if change1.position == change2.position:
-                return False
-
+        if first.change_type == second.change_type == 'table':
+            first_format = first.format_info or {}
+            second_format = second.format_info or {}
+            if first_format.get('structure_changed') or second_format.get('structure_changed'):
+                return True
+            first_cells = {(cell['row'], cell['col']) for cell in first_format.get('diff_cells', [])}
+            second_cells = {(cell['row'], cell['col']) for cell in second_format.get('diff_cells', [])}
+            return bool(first_cells & second_cells)
         return True
 
     def _detect_conflicts(self):
-        """检测多个副本对同一位置的冲突"""
-        all_changes = []
-        for changes in self.changes_by_author.values():
-            all_changes.extend(changes)
+        """检测多个副本对同一位置的冲突。"""
+        all_changes = [change for changes in self.changes_by_author.values() for change in changes]
+        all_changes.sort(key=lambda change: change.position)
+        self.conflicts.clear()
+        for position, group in groupby(all_changes, key=lambda change: change.position):
+            same_position = list(group)
+            conflict_ids = {
+                change.change_id
+                for first, second in combinations(same_position, 2)
+                if self._is_conflict(first, second)
+                for change in (first, second)
+            }
+            if not conflict_ids:
+                continue
 
-        # 按 position 排序
-        all_changes_by_pos = sorted(all_changes, key=lambda c: c.position)
+            changes = [change for change in same_position if change.change_id in conflict_ids]
+            conflict = MergeConflict(
+                conflict_id=f"conflict_{len(self.conflicts) + 1}",
+                position=position,
+                changes=changes,
+                severity=self._assess_severity(changes),
+                description=self._describe_conflict(changes),
+            )
+            self.conflicts.append(conflict)
+            print(f"    - 检测到冲突: {conflict.conflict_id} ({len(changes)} 个变更)")
 
-        i = 0
-        conflict_count = 0
-        while i < len(all_changes_by_pos):
-            change1 = all_changes_by_pos[i]
-            conflicting_changes = [change1]
-            j = i + 1
-
-            while j < len(all_changes_by_pos):
-                change2 = all_changes_by_pos[j]
-                if self._is_conflict(change1, change2):
-                    conflicting_changes.append(change2)
-                    j += 1
-                else:
-                    break
-
-            if len(conflicting_changes) > 1:
-                conflict = MergeConflict(
-                    conflict_id=f"conflict_{len(self.conflicts) + 1}",
-                    position=change1.position,
-                    changes=conflicting_changes,
-                    severity=self._assess_severity(conflicting_changes),
-                    description=self._describe_conflict(conflicting_changes)
-                )
-                self.conflicts.append(conflict)
-                conflict_count += 1
-                print(f"    - 检测到冲突: {conflict.conflict_id} ({len(conflicting_changes)} 个变更)")
-
-            i = j if j > i + 1 else i + 1
-
-        if conflict_count > 0:
-            conflict_change_ids = set()
-            for c in self.conflicts:
-                for change in c.changes:
-                    conflict_change_ids.add(change.change_id)
-            print(f"    - 冲突变更: {len(conflict_change_ids)} 条 (均保留各自版本)")
-        else:
-            print(f"    - 未检测到冲突")
+        if not self.conflicts:
+            print("    - 未检测到冲突")
 
     def _merge_positions(self, positions: List[int]) -> int:
         """获取冲突位置的代表值"""
@@ -3947,8 +3976,13 @@ class MultiCopyMerger:
             else:
                 setattr(change, 'true_block_index', change.position)
 
-        # 按 true_block_index 逆序排序，并确保在同一位置的多个副本按稳定的副本序号排序
-        all_changes_sorted = sorted(all_changes, key=lambda x: (x.true_block_index, x.copy_index), reverse=True)
+        # 同一位置先插入，再标记原文删除，最后写入修改版本。
+        def write_order(change):
+            operation = change.change_type.rsplit('_', 1)[-1]
+            priority = {'insert': 2, 'delete': 1}.get(operation, 0)
+            return change.true_block_index, priority, change.copy_index
+
+        all_changes_sorted = sorted(all_changes, key=write_order, reverse=True)
         print(f"    - 待写入变更: {len(all_changes_sorted)} 条")
 
         # 执行写回
@@ -3959,7 +3993,7 @@ class MultiCopyMerger:
             changes=all_changes_sorted,
             original_para_by_order=self._original_para_by_order,
             original_para_anchor_map=self._original_para_anchor_map,
-            conflicting_changes_by_para={}
+            conflicting_changes_by_para={conflict.position: conflict.changes for conflict in self.conflicts}
         )
         print(f"    ✓ 写回完成: {output_path}")
         return len(all_changes_sorted)
@@ -4044,8 +4078,7 @@ class MultiCopyMerger:
             print(f"✓ 冲突报告已生成: {report_path}")
 
         except Exception as e:
-            print(f"⚠️ 生成 TXT 报告失败: {e}")
-            import traceback; traceback.print_exc()
+            raise RuntimeError(f"无法写入冲突报告 {report_path}: {e}") from e
     
     def _create_conflict_report_html(self) -> str:
         """创建冲突报告 HTML"""
