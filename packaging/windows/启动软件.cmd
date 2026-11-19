@@ -4,8 +4,9 @@ chcp 65001 >nul
 cd /d "%~dp0"
 
 if exist ".venv\Scripts\pythonw.exe" if exist ".venv\Scripts\python.exe" (
-    ".venv\Scripts\python.exe" -m pip show mddm-document-merger >nul 2>&1
+    ".venv\Scripts\python.exe" -c "from importlib.metadata import version; import sys; sys.exit(version('mddm-document-merger') != '1.0.1')" >nul 2>&1
     if not errorlevel 1 goto start_gui
+    goto refresh_install
 )
 
 echo 正在准备运行环境...
@@ -23,8 +24,9 @@ python -m venv .venv
 
 :install
 if errorlevel 1 goto failed
+:refresh_install
 if not exist ".venv\Scripts\python.exe" goto failed
-".venv\Scripts\python.exe" -m pip install --no-index --find-links "%~dp0wheelhouse" mddm-document-merger==1.0.0
+".venv\Scripts\python.exe" -m pip install --no-index --find-links "%~dp0wheelhouse" mddm-document-merger==1.0.1
 if errorlevel 1 goto failed
 
 :start_gui

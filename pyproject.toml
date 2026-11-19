@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mddm-document-merger"
-version = "1.0.0"
-description = "Merge multiple department DOCX submissions with change tracking."
+version = "1.0.1"
+description = "多部门文档类自动合并软件系统"
 readme = "README.md"
 requires-python = ">=3.8"
 dependencies = [

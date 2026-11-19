@@ -25,11 +25,13 @@ import glob
 import zipfile
 import subprocess
 import shutil
+import tempfile
 import xml.etree.ElementTree as ET
 from typing import Optional, List
 from datetime import datetime
 # sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 from .multi_copy_merger import MultiCopyMerger
+from .output_batch import publish_outputs
 
 
 # 安全 XML 解析：处理 BOM 头和编码声明不一致的情况
@@ -806,7 +808,7 @@ def get_docx_author(file_path: str) -> str:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="基于 ONLYOFFICE 的多副本 Word 文档智能合并工具",
+        description="多部门文档类自动合并软件系统",
         formatter_class=argparse.RawTextHelpFormatter
     )
     
@@ -974,6 +976,7 @@ def main():
     print("\n" + "="*50)
     print("正在初始化合并系统...")
     
+    staging = None
     try:
         merger = MultiCopyMerger(
             original_abs,
@@ -1005,21 +1008,23 @@ def main():
             output_abs = os.path.join(output_dir, output_filename)
         
         if output_dir and not os.path.exists(output_dir):
-            os.makedirs(output_dir)
+            os.makedirs(output_dir, exist_ok=True)
             print(f"创建输出目录: {output_dir}")
         
         print(f"输出文件: {output_abs}")
+        destination_docx = output_abs
+        if os.path.exists(destination_docx) and any(
+            os.path.samefile(destination_docx, path) for path in [original_abs, *copy_files]
+        ):
+            raise ValueError(f"输出文件不能覆盖输入文档: {destination_docx}")
+        staging = tempfile.TemporaryDirectory(prefix=".mddm-stage-", dir=output_dir)
+        output_abs = os.path.join(staging.name, os.path.basename(destination_docx))
         
         # 定义冲突报告路径 (改为 TXT)
         conflict_report_txt = os.path.splitext(output_abs)[0] + "_conflicts.txt"
         
         result = merger.merge(output_abs, conflict_report_path=conflict_report_txt)
         
-        print("\n" + "="*50)
-        print("处理完成!")
-        print(f"生成文件: {result.merged_document}")
-        if os.path.exists(result.conflict_report):
-            print(f"冲突报告: {result.conflict_report}")
         
         # 准备全量日志收集器
         full_log_sections = []
@@ -1077,8 +1082,9 @@ def main():
             'image': '修改图片',
             'image_insert': '插入图片',
             'image_delete': '删除图片',
-            'sdt_insert': '插入SDT',
-            'sdt_delete': '删除SDT',
+            'sdt': '修改内容控件',
+            'sdt_insert': '插入内容控件',
+            'sdt_delete': '删除内容控件',
         }
 
         for c in all_changes:
@@ -1281,8 +1287,7 @@ def main():
                 print(f"✓ 标题处理完成 (修正: {heading_report.corrected_numbering} 处)")
                 
             except Exception as e:
-                print(f"⚠ 标题处理失败: {e}")
-                import traceback; traceback.print_exc()
+                raise RuntimeError(f"标题处理失败: {e}") from e
         else:
              print(f"\n[5/7] 智能标题处理 (跳过)")
 
@@ -1324,17 +1329,17 @@ def main():
                         if i % 10 == 0:
                             print(f"\r  进度: {i}/{total_paras}", end="")
                         
-                        result = corrector.correct_paragraph(para.get('text'), context=args.text_context)
+                        correction = corrector.correct_paragraph(para.get('text'), context=args.text_context)
                         
-                        if result.get('has_errors'):
+                        if correction.get('has_errors'):
                             # 估算页码 (参考 MultiCopyMerger 的 30 段/页 逻辑)
                             est_page = (para.get('index', i) // 30) + 1
                             corrections.append({
                                 'index': i,
                                 'page': est_page,
                                 'original': para.get('text'),
-                                'corrected': result.get('corrected_text'),
-                                'details': result.get('corrections')
+                                'corrected': correction.get('corrected_text'),
+                                'details': correction.get('corrections')
                             })
                     
                     print(f"\r  进度: {total_paras}/{total_paras} (完成)")
@@ -1495,25 +1500,21 @@ def main():
                 print(f"✓ 全量日志文档生成完毕: {merged_log_txt}")
 
             except Exception as e:
-                 print(f"⚠️ 生成日志文档失败: {e}")
-                 import traceback; traceback.print_exc()
+                raise RuntimeError(f"生成变更日志失败: {e}") from e
 
-        # === 最终步骤: 生成日志文档 ===
-        # if os.path.exists(output_abs) and merger and hasattr(merger, 'changes_by_author'):
-        #     try:
-        #         all_changes = []
-        #         for changes in merger.changes_by_author.values():
-        #             all_changes.extend(changes)
-        #         if all_changes:
-        #             inject_comments_to_docx(output_abs, all_changes)
-        #     except Exception as e:
-        #         print(f"⚠️ 批注注入失败: {e}")
+        publish_outputs(output_abs, destination_docx)
+        print(f"\n处理完成!\n生成文件: {destination_docx}")
+        print(f"冲突报告: {os.path.splitext(destination_docx)[0]}_conflicts.txt")
+        print(f"变更日志: {os.path.splitext(destination_docx)[0]}_merged_changes_log.txt")
 
     except Exception as e:
         print(f"\n错误: 合并过程中发生异常: {e}")
         import traceback
         traceback.print_exc()
         sys.exit(1)
+    finally:
+        if staging is not None:
+            staging.cleanup()
 
 if __name__ == '__main__':
     main()

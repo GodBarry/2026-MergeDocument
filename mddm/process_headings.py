@@ -23,7 +23,6 @@ import zipfile
 import tempfile
 import shutil
 import re
-import time
 from lxml import etree
 
 from .heading_processor import (
@@ -44,30 +43,11 @@ etree.register_namespace('w14', 'http://schemas.microsoft.com/office/word/2010/w
 etree.register_namespace('w15', 'http://schemas.microsoft.com/office/word/2012/wordml')
 
 
-def _safe_parse_xml(xml_path: str) -> etree._ElementTree:
-    """安全解析 XML，处理 BOM 和编码问题"""
-    try:
-        with open(xml_path, 'rb') as f:
-            raw = f.read()
-        # 去除 UTF-8 BOM
-        if raw.startswith(b'\xef\xbb\xbf'):
-            raw = raw[3:]
-        # 去除 UTF-16 BOM
-        if raw.startswith(b'\xff\xfe') or raw.startswith(b'\xfe\xff'):
-            text = raw.decode('utf-16')
-            raw = text.encode('utf-8')
-        # 修正编码声明
-        content = raw.decode('utf-8', errors='replace')
-        content = re.sub(
-            r'<\?xml[^>]*encoding="[^"]*"',
-            '<?xml version="1.0" encoding="UTF-8"',
-            content,
-            count=1
-        )
-        root = etree.fromstring(content.encode('utf-8'))
-        return etree.ElementTree(root)
-    except Exception:
-        raise
+def _heading_text_nodes(paragraph):
+    """Visible heading text, excluding nested paragraphs and deleted runs."""
+    return [node for node in paragraph.iter(W_TAG('t'))
+            if next(node.iterancestors(W_TAG('p')), None) is paragraph
+            and next(node.iterancestors(W_TAG('del')), None) is None]
 
 
 def extract_paragraphs_from_document(doc_path: str) -> list:
@@ -98,16 +78,10 @@ def extract_paragraphs_from_document(doc_path: str) -> list:
             # 预读自动编号
             numbering_map = _load_numbering(zf)
 
-            para_index = 0
-            for child in body:
-                tag = child.tag.split('}')[-1] if '}' in child.tag else child.tag
-
-                if tag != 'p':
-                    continue
-
+            for para_index, child in enumerate(body.findall(W_TAG('p'))):
                 # 提取纯文本
-                all_texts = [t.text for t in child.iter(W_TAG('t')) if t.text]
-                raw_text = ''.join(all_texts).replace('\r', '').replace('\n', '').strip()
+                all_texts = [t.text for t in _heading_text_nodes(child) if t.text]
+                raw_text = ''.join(all_texts).strip()
 
                 if not raw_text:
                     continue
@@ -193,15 +167,12 @@ def extract_paragraphs_from_document(doc_path: str) -> list:
                     'style_name': style_name,
                     '_xml_element': child,  # 保留引用用于应用修改
                 })
-                para_index += 1
 
         print(f"✓ 读取完成，共 {len(paragraphs)} 个段落")
         return paragraphs
 
-    except Exception as e:
-        print(f"⚠ 读取文档失败: {e}")
-        import traceback; traceback.print_exc()
-        return paragraphs
+    except (OSError, zipfile.BadZipFile, etree.XMLSyntaxError) as error:
+        raise ValueError(f"读取标题失败 {doc_path}: {error}") from error
 
 
 def _load_styles(zf: zipfile.ZipFile) -> dict:
@@ -232,141 +203,104 @@ def _load_numbering(zf: zipfile.ZipFile) -> dict:
     return {}
 
 
+def _replace_heading_number(nodes, original, updated):
+    """Replace the changed prefix while preserving runs and comment or bookmark anchors."""
+    text = ''.join(node.text or '' for node in nodes)
+    start = len(text) - len(text.lstrip())
+    left = 0
+    while left < min(len(original), len(updated)) and original[left] == updated[left]:
+        left += 1
+    right = 0
+    while (right < min(len(original), len(updated)) - left
+           and original[-right-1] == updated[-right-1]):
+        right += 1
+    begin, end = start + left, start + len(original) - right
+    insert = updated[left:len(updated)-right]
+    pos = 0
+    inserted = False
+    for node in nodes:
+        value = node.text or ''
+        limit = pos + len(value)
+        if (pos <= begin < limit or begin == limit == len(text)) and not inserted:
+            node.text = value[:begin-pos] + insert + value[max(end-pos, 0):]
+            inserted = True
+        elif pos < end and limit > begin:
+            node.text = value[max(end-pos, 0):]
+        if node.text and (node.text[0].isspace() or node.text[-1].isspace()):
+            node.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
+        pos = limit
+
+
 def apply_headings_to_document(doc_path: str, headings: list, output_path: str):
-    """
-    将处理后的标题应用到文档（纯 Python zipfile + lxml 实现）
-    """
-    print(f"\n正在应用标题修正到文档...")
-
-    temp_dir = tempfile.mkdtemp()
-    temp_output = doc_path + '.heading.tmp'
-
+    """Apply heading edits to their original top-level paragraphs."""
+    output_dir = os.path.dirname(os.path.abspath(output_path))
+    temp_path = None
     try:
-        # 1. 解压
-        with zipfile.ZipFile(doc_path, 'r') as zf:
-            zf.extractall(temp_dir)
+        with zipfile.ZipFile(doc_path) as package:
+            root = etree.fromstring(package.read('word/document.xml'))
+            body = root.find(W_TAG('body'))
+            if body is None:
+                raise ValueError("文档中缺少正文")
+            paragraphs = body.findall(W_TAG('p'))
+            heading_styles = {}
+            for style_id, name in _load_styles(package).items():
+                match = re.fullmatch(r'(?:heading|标题)\s*([1-9])', name, re.I)
+                if match:
+                    heading_styles[int(match.group(1))] = style_id
 
-        doc_xml_path = os.path.join(temp_dir, 'word', 'document.xml')
+            applied = 0
+            for heading in headings:
+                if heading.is_placeholder or heading.index < 0:
+                    continue
+                para = paragraphs[heading.index]
+                nodes = _heading_text_nodes(para)
+                actual = ''.join(node.text or '' for node in nodes).strip()
+                original = heading.original_text or heading.text
+                if actual != original:
+                    raise ValueError(f"标题位置或文本发生变化，段落 {heading.index + 1}")
+                before = etree.tostring(para)
+                props = para.find(W_TAG('pPr'))
+                if props is None:
+                    props = etree.Element(W_TAG('pPr'))
+                    para.insert(0, props)
+                style_id = heading_styles.get(heading.true_level)
+                if style_id:
+                    style = props.find(W_TAG('pStyle'))
+                    if style is None:
+                        style = etree.Element(W_TAG('pStyle'))
+                        props.insert(0, style)
+                    style.set(W_TAG('val'), style_id)
+                if heading.true_level:
+                    outline = props.find(W_TAG('outlineLvl'))
+                    if outline is None and not style_id:
+                        outline = etree.Element(W_TAG('outlineLvl'))
+                        following_tags = {W_TAG(tag) for tag in ('divId', 'cnfStyle', 'rPr', 'sectPr', 'pPrChange')}
+                        insert_at = next((i for i, item in enumerate(props) if item.tag in following_tags), len(props))
+                        props.insert(insert_at, outline)
+                    if outline is not None:
+                        outline.set(W_TAG('val'), str(heading.true_level - 1))
+                if heading.text != original:
+                    _replace_heading_number(nodes, original, heading.text)
+                    numbering = props.find(W_TAG('numPr'))
+                    if numbering is not None:
+                        props.remove(numbering)
+                if before != etree.tostring(para):
+                    applied += 1
 
-        # 2. 解析 document.xml
-        tree = _safe_parse_xml(doc_xml_path)
-        root = tree.getroot()
-        body = root.find(W_TAG('body'))
-
-        if body is None:
-            print("⚠ 未找到 body 元素，跳过")
-            return
-
-        # 建立段落索引映射
-        block_tags = {W_TAG('p'), W_TAG('tbl'), W_TAG('sdt')}
-        body_children = [c for c in body if c.tag in block_tags]
-
-        # 建立索引 -> 元素的映射
-        idx_to_element = {}
-        for i, child in enumerate(body_children):
-            if child.tag == W_TAG('p'):
-                idx_to_element[i] = child
-
-        # 3. 应用标题修改
-        heading_map = {h.index: h for h in headings if not h.is_placeholder and h.index >= 0}
-
-        applied_count = 0
-        for idx, heading in heading_map.items():
-            if idx not in idx_to_element:
-                continue
-
-            para = idx_to_element[idx]
-
-            # 清空段落内容，保留 pPr
-            pPr = para.find(W_TAG('pPr'))
-            para.clear()  # 清空所有子元素
-            if pPr is not None:
-                para.append(pPr)
-
-            # 设置样式
-            if pPr is None:
-                pPr = etree.SubElement(para, W_TAG('pPr'))
-
-            # 清除现有样式设置
-            existing_style = pPr.find(W_TAG('pStyle'))
-            if existing_style is not None:
-                pPr.remove(existing_style)
-
-            # 清除自动编号（防止双重编号）
-            existing_numPr = pPr.find(W_TAG('numPr'))
-            if existing_numPr is not None:
-                pPr.remove(existing_numPr)
-
-            # 设置新的样式
-            style_name = f"Heading {heading.true_level}"
-            pStyle = etree.SubElement(pPr, W_TAG('pStyle'))
-            pStyle.set(W_TAG('val'), style_name)
-
-            # 清除现有的文字运行
-            for r in list(para.findall(W_TAG('r'))):
-                para.remove(r)
-
-            # 添加新文本 run
-            r_el = etree.SubElement(para, W_TAG('r'))
-            rPr_el = etree.SubElement(r_el, W_TAG('rPr'))
-
-            # 设置加粗
-            if heading.is_bold:
-                etree.SubElement(rPr_el, W_TAG('b'))
-
-            # 设置字体大小
-            if heading.font_size and heading.font_size > 0:
-                sz_el = etree.SubElement(rPr_el, W_TAG('sz'))
-                sz_el.set(W_TAG('val'), str(heading.font_size * 2))  # 恢复半磅值
-                szCs_el = etree.SubElement(rPr_el, W_TAG('szCs'))
-                szCs_el.set(W_TAG('val'), str(heading.font_size * 2))
-
-            t_el = etree.SubElement(r_el, W_TAG('t'))
-            t_el.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
-            t_el.text = heading.text
-
-            applied_count += 1
-
-        # 4. 写回 document.xml
-        tree.write(doc_xml_path, xml_declaration=True, encoding='UTF-8', standalone=True)
-
-        # 5. 重新打包
-        with zipfile.ZipFile(temp_output, 'w', zipfile.ZIP_DEFLATED) as zf_out:
-            mimetype_path = os.path.join(temp_dir, 'mimetype')
-            if os.path.exists(mimetype_path):
-                zf_out.write(mimetype_path, 'mimetype', compress_type=zipfile.ZIP_STORED)
-            for root_dir, _, files in os.walk(temp_dir):
-                for fname in files:
-                    if fname == 'mimetype':
-                        continue
-                    fp = os.path.join(root_dir, fname)
-                    arc = os.path.relpath(fp, temp_dir)
-                    zf_out.write(fp, arc, compress_type=zipfile.ZIP_DEFLATED)
-
-        # 6. 原子替换
-        replaced = False
-        last_err = None
-        for _ in range(6):
-            try:
-                os.replace(temp_output, output_path)
-                replaced = True
-                break
-            except Exception as _re:
-                last_err = _re
-                time.sleep(0.2)
-        if not replaced:
-            raise last_err
-
-        print(f"✓ 文档已保存: {output_path} (应用了 {applied_count} 处标题修正)")
-
-    except Exception as e:
-        print(f"⚠ 应用标题失败: {e}")
-        import traceback; traceback.print_exc()
-        if os.path.exists(temp_output):
-            try: os.remove(temp_output)
-            except Exception: pass
+            fd, temp_path = tempfile.mkstemp(dir=output_dir, suffix='.heading.tmp')
+            os.close(fd)
+            with zipfile.ZipFile(temp_path, 'w') as output:
+                for part in package.infolist():
+                    if part.filename == 'word/document.xml':
+                        output.writestr(part, etree.tostring(root, xml_declaration=True, encoding='UTF-8', standalone=True))
+                    else:
+                        with package.open(part) as source, output.open(part, 'w') as target:
+                            shutil.copyfileobj(source, target)
+        os.replace(temp_path, output_path)
+        print(f"✓ 文档已保存: {output_path} (调整了 {applied} 个标题)")
     finally:
-        shutil.rmtree(temp_dir, ignore_errors=True)
+        if temp_path and os.path.exists(temp_path):
+            os.unlink(temp_path)
 
 
 def main():

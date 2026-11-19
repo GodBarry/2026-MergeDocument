@@ -90,7 +90,7 @@ def run_merge(paths, events):
 class MergeWindow:
     def __init__(self, root):
         self.root = root
-        self.root.title("多部门文档自动合并系统")
+        self.root.title("多部门文档类自动合并软件系统")
         self.root.geometry("940x690")
         self.root.minsize(735, 590)
         self.root.configure(background=BACKGROUND)

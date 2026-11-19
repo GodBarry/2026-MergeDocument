@@ -220,7 +220,7 @@ class HeadingDetector:
         # 第一遍：提取特征
         para_features = []
         for i, para in enumerate(paragraphs):
-            features = self._extract_features(para, i)
+            features = self._extract_features(para, para.get('index', i))
             para_features.append(features)
         
         # 估算文档基准字体大小
@@ -718,7 +718,7 @@ class HeadingProcessor:
             print(f"  ✓ 检测到 {len(headings)} 个标题")
         else:
             # 使用已有的标题信息
-            headings = [HeadingInfo(index=i, text=p['text']) 
+            headings = [HeadingInfo(index=p.get('index', i), text=p['text'])
                        for i, p in enumerate(paragraphs) if p.get('isHeading')]
             self.report.detected_headings = len(headings)
         

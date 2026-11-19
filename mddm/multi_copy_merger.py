@@ -6,6 +6,7 @@
 import os
 import sys
 import json
+from copy import deepcopy
 import posixpath
 import re
 from itertools import combinations, groupby
@@ -20,6 +21,7 @@ from pathlib import Path
 import tempfile
 
 from lxml import etree
+from .word_comments import WordComments
 
 # 锚点引擎
 from .anchor_engine import (
@@ -198,6 +200,9 @@ def _paragraph_signature(element, relationships):
     for child in element:
         if not isinstance(child.tag, str) or child.tag in _IGNORED_PARAGRAPH_TAGS:
             continue
+        if child.tag == _wtag('r') and child.find(_wtag('commentReference')) is not None:
+            if all(node.tag in (_wtag('rPr'), _wtag('commentReference')) for node in child):
+                continue
         part = _paragraph_signature(child, relationships)
         if child.tag in (_wtag('pPr'), _wtag('rPr')) and not any(part[1:]):
             continue
@@ -300,8 +305,7 @@ class DocItem:
         return tuple(tuple((cell['rowspan'], cell['colspan']) for cell in row) for row in self.rows)
 
     def table_diff_key(self) -> tuple:
-        cell_text = tuple(tuple(cell['text'] for cell in row) for row in self.rows)
-        return self.table_shape(), cell_text
+        return tuple(tuple(cell['signature'] for cell in row) for row in self.rows)
 
     def __repr__(self):
         return f"<DocItem {self.type} #{self.index}: {self.content[:30]!r}>"
@@ -396,7 +400,7 @@ class OpenXMLDocumentEngine:
 
                 elif tag == 'tbl':
                     # 表格
-                    item = self._extract_table_item(child, table_counter)
+                    item = self._extract_table_item(child, table_counter, relationships)
                     table_counter += 1
                     item.body_tag = 'tbl'
                     items.append(item)
@@ -411,6 +415,7 @@ class OpenXMLDocumentEngine:
                 elif tag == 'sdt':
                     # 结构化文档标签
                     item = self._extract_sdt_item(child, item_idx)
+                    item.paragraph_signature = _paragraph_signature(child, relationships)
                     item.body_tag = 'sdt'
                     items.append(item)
                     item.index = len(items) - 1
@@ -707,7 +712,7 @@ class OpenXMLDocumentEngine:
     # ------------------------------------------------------------------
     # 表格提取
     # ------------------------------------------------------------------
-    def _extract_table_item(self, tbl: etree._Element, tbl_idx: int) -> DocItem:
+    def _extract_table_item(self, tbl: etree._Element, tbl_idx: int, relationships: dict) -> DocItem:
         item = DocItem()
         item.index = -1
         item.type = 'table'
@@ -730,6 +735,7 @@ class OpenXMLDocumentEngine:
                 cell_text = self._get_cell_text(tc)
                 row.append({
                     'text': cell_text,
+                    'signature': _paragraph_signature(tc, relationships),
                     'rowspan': vMerge,
                     'colspan': hMerge,
                 })
@@ -764,14 +770,10 @@ class OpenXMLDocumentEngine:
         item = DocItem()
         item.index = idx
         item.type = 'sdt'
-        tag_el = sdt.find(f'.//{_wtag("tag")}')
-        item.item_id = tag_el.get(_wtag('val'), '') if tag_el is not None else f'sdt_{idx}'
         item.xml = sdt
-        # 取 SDT 内第一个段落文字
-        first_p = sdt.find(_wtag('p'))
-        if first_p is not None:
-            texts = [t.text for t in first_p.iter(_wtag('t')) if t.text]
-            item.content = ''.join(texts).strip()
+        content = sdt.find(_wtag('sdtContent'))
+        if content is not None:
+            item.content = '\n'.join(self._get_para_text(p) for p in content.iter(_wtag('p')))
         item.item_id = hashlib.md5(f"{item.content}|sdt".encode()).hexdigest()[:16]
         return item
 
@@ -894,17 +896,8 @@ class OpenXMLDocumentEngine:
                            if node.get('id', '').isdecimal())
             self._next_drawing_id = max(drawing_ids, default=0) + 1
 
-            # 解析现有评论 ID 确保唯一性
-            comments_path = os.path.join(extract_dir, 'word', 'comments.xml')
-            global_next_cid = 0
-            if os.path.exists(comments_path):
-                try:
-                    existing_c_tree = etree.parse(comments_path)
-                    existing_c_ids = [int(el.get(_wtag('id'), 0)) for el in existing_c_tree.getroot().findall('.//' + _wtag('comment'))]
-                    if existing_c_ids:
-                        global_next_cid = max(existing_c_ids) + 1
-                except Exception:
-                    pass
+            self.review_comments = WordComments(base_doc, copies)
+            global_next_cid = self.review_comments.next_id
 
             # 💡 核心改进：按 (副本索引, 作者) 存储批注，确保颜色一致
             self.copy_comment_ids = {} # {copy_idx: [(cid, author, text)]}
@@ -970,7 +963,7 @@ class OpenXMLDocumentEngine:
                         if is_conflict:
                             self._replaced_positions.add(pos)
 
-                    elif ctype in ('modify', 'table', 'image'):
+                    elif ctype in ('modify', 'table', 'image', 'sdt'):
                         self._apply_modify(body, blocks, pos, change, author, color, get_comment_id,
                                            extract_dir, copy_path, skip_comment, is_conflict)
 
@@ -979,13 +972,16 @@ class OpenXMLDocumentEngine:
 
                     # 移除了块索引的灾难性刷新
 
+            self.review_comments.restore_ranges(body)
             # 写回 document.xml
+            self._deduplicate_control_ids(body)
             doc_tree.write(doc_xml_path, xml_declaration=True,
                            encoding='UTF-8', standalone=True)
 
             # 更新 comments.xml（如有新增批注）
-            if self.copy_comment_ids:
+            if self.copy_comment_ids or self.review_comments.imports:
                 self._update_comments_xml(extract_dir, self.copy_comment_ids, copy_colors)
+                self.review_comments.write(extract_dir, self._clone_relationships_and_media)
 
             # 先在输出目录生成完整文件，再替换目标，避免留下半写入的合稿。
             with tempfile.NamedTemporaryFile(dir=output_dir, suffix='.tmp', delete=False) as staged:
@@ -1063,6 +1059,17 @@ class OpenXMLDocumentEngine:
         if ctype == 'table':
             self._apply_table_diff(body, blocks, pos, change, author, color, get_cid_fn,
                                    extract_dir, copy_path, skip_comment, is_conflict)
+        elif ctype == 'sdt':
+            control = etree.fromstring(change.format_info['copy_xml'].encode('utf-8'))
+            self._prepare_copy_block(control, change.copy_index, copy_path, extract_dir)
+            if not skip_comment:
+                cid = get_cid_fn(change.copy_index, author, f"[{author} 修改内容控件]")
+                self._add_comment_to_element(control, cid, author)
+            if is_conflict:
+                blk.addnext(control)
+            else:
+                body.replace(blk, control)
+                blocks[pos] = control
         else:
             # 段落修改
             self._apply_para_modify(body, blocks, pos, change, author, color, get_cid_fn, extract_dir, copy_path, skip_comment)
@@ -1089,7 +1096,8 @@ class OpenXMLDocumentEngine:
         for run in block.iter(_wtag('r')):
             rPr = run.find(_wtag('rPr'))
             if rPr is None:
-                rPr = etree.SubElement(run, _wtag('rPr'))
+                rPr = etree.Element(_wtag('rPr'))
+                run.insert(0, rPr)
             
             # 1. 删除线
             existing = rPr.find(_wtag('strike'))
@@ -1104,6 +1112,7 @@ class OpenXMLDocumentEngine:
 
     def _assign_copy_local_ids(self, element, copy_index):
         """Assign fresh drawing and revision identifiers to imported markup."""
+        self.review_comments.remap(element, copy_index)
         for node in element.iter():
             if node.tag == _wptag('docPr') and node.get('id') is not None:
                 node.set('id', str(self._next_drawing_id))
@@ -1425,77 +1434,80 @@ class OpenXMLDocumentEngine:
         if tbl_el.tag != _wtag('tbl'):
             return
 
-        fmt = change.format_info or {}
-        diff_cells = json.loads(change.content)
-        copy_table_xml = fmt.get('copy_tbl_xml')
-        if copy_table_xml and (fmt.get('structure_changed') or is_conflict):
-            copy_table = etree.fromstring(copy_table_xml.encode('utf-8'))
-            if extract_dir and copy_path:
-                self._clone_relationships_and_media(copy_table, copy_path, extract_dir)
-
+        fmt = change.format_info
+        copy_table = etree.fromstring(fmt['copy_tbl_xml'].encode('utf-8'))
+        diff_cells = fmt['diff_cells']
+        if fmt['structure_changed'] or is_conflict:
+            self._prepare_copy_block(copy_table, change.copy_index, copy_path, extract_dir)
             label = '表格变更冲突，副本待复核' if is_conflict else '修改表格结构'
-            first_p = copy_table.find('.//' + _wtag('p'))
-            if first_p is not None and not skip_comment:
-                cid = get_cid_fn(change.copy_index, author, f"[{author} {label}]")
-                self._add_comment_to_element(first_p, cid, author)
-
             if is_conflict:
                 tbl_el.addnext(copy_table)
             else:
                 body.replace(tbl_el, copy_table)
                 blocks[pos] = copy_table
-            return
+            comment_target = copy_table
+        else:
+            # Replace only edited cells so independent submissions can update different cells.
+            target_rows = tbl_el.findall(_wtag('tr'))
+            source_rows = copy_table.findall(_wtag('tr'))
+            comment_target = None
+            for diff in diff_cells:
+                row, col = diff['row'], diff['col']
+                source_cell = source_rows[row].findall(_wtag('tc'))[col]
+                target_cell = target_rows[row].findall(_wtag('tc'))[col]
+                replacement = deepcopy(source_cell)
+                old_paragraphs = [self._get_para_text(p) for p in target_cell.iter(_wtag('p'))]
+                for index, para in enumerate(replacement.iter(_wtag('p'))):
+                    if index >= len(old_paragraphs) or self._get_para_text(para) != old_paragraphs[index]:
+                        self._color_runs(para, color)
+                self._prepare_copy_block(replacement, change.copy_index, copy_path, extract_dir)
+                target_rows[row].replace(target_cell, replacement)
+                if comment_target is None:
+                    comment_target = replacement
+            label = f"修改表格 {len(diff_cells)} 处"
 
-        for diff in diff_cells:
-            r_idx = diff.get('row', 0)
-            c_idx = diff.get('col', 0)
-            new_text = diff.get('new', '')
+        if not skip_comment and comment_target is not None:
+            cid = get_cid_fn(change.copy_index, author, f"[{author} {label}]")
+            self._add_comment_to_element(comment_target, cid, author)
 
-            rows = tbl_el.findall(_wtag('tr'))
-            if r_idx >= len(rows):
+    def _prepare_copy_block(self, element, copy_index, copy_path, extract_dir):
+        self._assign_copy_local_ids(element, copy_index)
+        if extract_dir and copy_path:
+            self._clone_relationships_and_media(element, copy_path, extract_dir)
+
+    @staticmethod
+    def _deduplicate_control_ids(body):
+        # Conflicting copies of the same content control are distinct controls in the output.
+        ids = body.findall(f'.//{_wtag("sdtPr")}/{_wtag("id")}')
+        key = _wtag('val')
+        reserved = {node.get(key) for node in ids}
+        seen = set()
+        candidate = 1
+        for node in ids:
+            value = node.get(key)
+            if value in seen:
+                while str(candidate) in reserved:
+                    candidate += 1
+                value = str(candidate)
+                node.set(key, value)
+                reserved.add(value)
+            seen.add(value)
+
+    def _color_runs(self, element, color):
+        for run in element.iter(_wtag('r')):
+            if run.find(_wtag('t')) is None:
                 continue
-            row_el = rows[r_idx]
-            cells = row_el.findall(_wtag('tc'))
-            if c_idx >= len(cells):
-                continue
-            cell_el = cells[c_idx]
+            properties = run.find(_wtag('rPr'))
+            if properties is None:
+                properties = etree.Element(_wtag('rPr'))
+                run.insert(0, properties)
+            clr = properties.find(_wtag('color'))
+            if clr is None:
+                clr = etree.SubElement(properties, _wtag('color'))
+            clr.set(_wtag('val'), color)
 
-            # 更新单元格文字
-            for para in cell_el.findall(_wtag('p')):
-                for run in para.findall(_wtag('r')):
-                    for t in run.findall(_wtag('t')):
-                        t.text = ''
-                # 找一个 run 或新建
-                runs = [r for r in para.findall(_wtag('r')) if r.find(_wtag('t')) is not None or r.find(_wtag('delText')) is not None]
-                if runs:
-                    r = runs[0]
-                else:
-                    r = etree.SubElement(para, _wtag('r'))
-                t_el = r.find(_wtag('t'))
-                if t_el is None:
-                    t_el = etree.SubElement(r, _wtag('t'))
-                t_el.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
-                t_el.text = new_text
-
-                # 加红色
-                rPr = r.find(_wtag('rPr'))
-                if rPr is None:
-                    rPr = etree.SubElement(r, _wtag('rPr'))
-                clr = rPr.find(_wtag('color'))
-                if clr is None:
-                    clr = etree.SubElement(rPr, _wtag('color'))
-                clr.set(_wtag('val'), color)  # 用作者颜色标
-
-        # 不要在表格外插入提示段落，而是把批注加到表格最前面的格子
-        if not skip_comment:
-            copy_idx = change.copy_index
-            comment_text = f"[{author} 修改表格] {len(diff_cells)} 处修改"
-            tbl_cid = get_cid_fn(copy_idx, author, comment_text)
-            first_p = tbl_el.find('.//' + _wtag('p'))
-            if first_p is not None:
-                self._add_comment_to_element(first_p, tbl_cid, author)
-
-    def _clone_relationships_and_media(self, elem: etree._Element, copy_path: str, extract_dir: str):
+    def _clone_relationships_and_media(self, elem: etree._Element, copy_path: str, extract_dir: str,
+                                      owner: str = 'document.xml'):
         """
         复制 elem 内部引用的 rId 对应资源，并更新 elem 中的 rId 以匹配 target 的 .rels。
         同时更新相应的 [Content_Types].xml。
@@ -1513,15 +1525,16 @@ class OpenXMLDocumentEngine:
 
         try:
             with zipfile.ZipFile(copy_path, 'r') as source_zf:
-                if 'word/_rels/document.xml.rels' not in source_zf.namelist():
-                    raise ValueError("副本缺少正文的资源关系表")
-                with source_zf.open('word/_rels/document.xml.rels') as f:
+                rels_part = f'word/_rels/{owner}.rels'
+                if rels_part not in source_zf.namelist():
+                    raise ValueError(f"副本缺少资源关系表: {rels_part}")
+                with source_zf.open(rels_part) as f:
                     source_rels_root = etree.parse(f).getroot()
 
                 with source_zf.open('[Content_Types].xml') as f:
                     source_ct_root = etree.parse(f).getroot()
 
-                target_rels_path = os.path.join(extract_dir, 'word', '_rels', 'document.xml.rels')
+                target_rels_path = os.path.join(extract_dir, 'word', '_rels', owner + '.rels')
                 if os.path.exists(target_rels_path):
                     target_rels_tree = etree.parse(target_rels_path)
                 else:
@@ -1592,7 +1605,8 @@ class OpenXMLDocumentEngine:
                         source_part = posixpath.normpath(posixpath.join('/word', target_path_relative))
                         source_item_path = source_part.lstrip('/')
                         dirname, filename = posixpath.split(source_part)
-                        new_part = posixpath.join(dirname, f"{new_rid}_{filename}")
+                        prefix = '' if owner == 'document.xml' else 'comment_'
+                        new_part = posixpath.join(dirname, f"{prefix}{new_rid}_{filename}")
                         dest_path = os.path.abspath(os.path.join(extract_dir, *new_part.lstrip('/').split('/')))
                         if os.path.commonpath((extract_dir, dest_path)) != extract_dir:
                             raise ValueError("DOCX 资源路径超出合稿目录")
@@ -1683,82 +1697,25 @@ class OpenXMLDocumentEngine:
                 cid = get_cid_fn(copy_idx, author, comment_text)
 
         xml_str = fmt.get('copy_xml') or fmt.get('copy_tbl_xml') or fmt.get('copy_img_xml')
-        new_parsed_el = None
-        
         if xml_str:
-            new_parsed_el = etree.fromstring(xml_str.encode('utf-8'))
-            self._assign_copy_local_ids(new_parsed_el, change.copy_index)
-            if extract_dir and copy_path:
-                self._clone_relationships_and_media(new_parsed_el, copy_path, extract_dir)
-
-        if new_parsed_el is not None and new_parsed_el.tag == _wtag('tbl'):
-            new_tbl = new_parsed_el
-            new_para = None
-        elif new_parsed_el is not None:
-            new_tbl = None
-            new_para = new_parsed_el
+            new_block = etree.fromstring(xml_str.encode('utf-8'))
+            self._prepare_copy_block(new_block, copy_idx, copy_path, extract_dir)
         else:
-            # 纯文本 fallback（针对未携带 XML或提取失败的）
-            new_tbl = None
-            if item_type == 'paragraph':
-                text = change.content if change.content else ""
-                new_para = self._make_para(text)
-            else:
-                new_para = self._make_para(f"[{item_type} 插入]")
+            text = change.content if item_type == 'paragraph' else f"[{item_type} 插入]"
+            new_block = self._make_para(text or "")
 
-        if new_para is not None:
-            if cid is not None:
-                self._add_comment_to_element(new_para, cid, author)
-            
-            # # 💡 核心改进：根据推断级别修正段落属性（样式与纲目级别）
-            # actual_level = fmt.get('actual_level', 0)
-            # self._set_heading_attributes(new_para, actual_level)
+        if new_block.tag == _wtag('tbl'):
+            self._ensure_table_borders(new_block)
+        self._color_runs(new_block, color)
+        if cid is not None:
+            self._add_comment_to_element(new_block, cid, author)
 
-        # 不再单独插入外部的批注文字段落，直接操作元素本身
-        if item_type == 'table' and new_tbl is not None:
-            # 确保表格有默认边框（新增表格可能没有边框定义）
-            self._ensure_table_borders(new_tbl)
-
-            # 标红所有内部文字
-            for r in new_tbl.findall('.//' + _wtag('r')):
-                rPr = r.find(_wtag('rPr'))
-                if rPr is None:
-                    rPr = etree.Element(_wtag('rPr'))
-                    r.insert(0, rPr)
-                clr = rPr.find(_wtag('color'))
-                if clr is None:
-                    clr = etree.SubElement(rPr, _wtag('color'))
-                clr.set(_wtag('val'), color)
-                
-            # 把批注挂载到表格的第一个段落，避免割裂上下文
-            if cid is not None:
-                first_p = new_tbl.find('.//' + _wtag('p'))
-                if first_p is not None:
-                    self._add_comment_to_element(first_p, cid, author)
-            
-            if 0 <= pos <= len(blocks):
-                insert_idx = list(body).index(blocks[pos]) if pos < len(blocks) else len(body)
-            else:
-                insert_idx = len(body)
-            body.insert(insert_idx, new_tbl)
+        # The final section-properties element must remain the last child of w:body.
+        following = blocks[pos] if 0 <= pos < len(blocks) else body.find(_wtag('sectPr'))
+        if following is None:
+            body.append(new_block)
         else:
-            # 段落或其他元素：将其文字标红，然后直接插入
-            if new_para is not None:
-                for r in new_para.findall('.//' + _wtag('r')):
-                    rPr = r.find(_wtag('rPr'))
-                    if rPr is None:
-                        rPr = etree.Element(_wtag('rPr'))
-                        r.insert(0, rPr)
-                    clr = rPr.find(_wtag('color'))
-                    if clr is None:
-                        clr = etree.SubElement(rPr, _wtag('color'))
-                    clr.set(_wtag('val'), color)
-                
-                if 0 <= pos <= len(blocks):
-                    insert_idx = list(body).index(blocks[pos]) if pos < len(blocks) else len(body)
-                else:
-                    insert_idx = len(body)
-                body.insert(insert_idx, new_para)
+            following.addprevious(new_block)
 
     # def _set_heading_attributes(self, p_el: etree._Element, level: int) -> None:
     #     """为段落设置标题属性（样式 ID 和纲目级别）
@@ -2604,6 +2561,7 @@ class MultiCopyMerger:
             ctype_map = {
                 'insert': '[新增]', 'delete': '[删除]', 'modify': '[修改]',
                 'table': '[表格]', 'image': '[图片]', 'table_insert': '[表增]',
+                'sdt': '[内容控件]',
                 'table_delete': '[表删]', 'image_insert': '[图增]', 'image_delete': '[图删]'
             }
             ctype_disp = ctype_map.get(change.change_type, f"[{change.change_type.upper()}]")
@@ -3630,6 +3588,21 @@ class MultiCopyMerger:
                 format_info=format_info,
             ))
 
+        elif o_item.type == c_item.type == 'sdt':
+            changes.append(DocumentChange(
+                change_id=f"{author}_{copy_index}_sdt_{o_item.index}",
+                change_type='sdt',
+                position=o_item.index,
+                content=c_item.content,
+                author=author,
+                timestamp=datetime.now(),
+                copy_index=copy_index,
+                page_number=o_item.page,
+                paragraph_index=o_item.index,
+                para_order=o_item.index,
+                format_info={'item_type': 'sdt', 'copy_xml': etree.tostring(c_item.xml, encoding='unicode')},
+            ))
+
         elif o_item.type == 'image':
             changes.append(DocumentChange(
                 change_id=f"{author}_{copy_index}_img_mod_{o_item.index}",
@@ -3789,7 +3762,7 @@ class MultiCopyMerger:
                 o_text = (o_cell.get('text', '') or '' if isinstance(o_cell, dict) else '').strip()
                 c_text = (c_cell.get('text', '') or '' if isinstance(c_cell, dict) else '').strip()
 
-                if o_text != c_text:
+                if (o_cell or {}).get('signature') != (c_cell or {}).get('signature'):
                     diff_cells.append({
                         'row': r,
                         'col': c,
@@ -4067,20 +4040,14 @@ class MultiCopyMerger:
         for changes in self.changes_by_author.values():
             all_changes.extend(changes)
 
-        # ── 关键映射：items 索引 → body 直接子元素索引 ──────────────────────
-        items_idx_to_block_idx: Dict[int, int] = {}
-        current_block_idx = -1
-        for i, item in enumerate(self.orig_items):
-            if item.type in ('paragraph', 'table', 'sdt'):
-                current_block_idx += 1
-            items_idx_to_block_idx[i] = current_block_idx
-
-        # 给每个 change 附加 true_block_index
+        # An insertion refers to a gap in the original document. Its position is the number
+        # of editable blocks before that gap, including when the next item is w:sectPr.
+        blocks_before = [0]
+        for item in self.orig_items:
+            editable = item.type in ('paragraph', 'table', 'sdt')
+            blocks_before.append(blocks_before[-1] + int(editable))
         for change in all_changes:
-            if change.position in items_idx_to_block_idx:
-                setattr(change, 'true_block_index', items_idx_to_block_idx[change.position])
-            else:
-                setattr(change, 'true_block_index', change.position)
+            change.true_block_index = blocks_before[change.position]
 
         # 同一位置先插入，再标记原文删除，最后写入修改版本。
         def write_order(change):
@@ -4171,6 +4138,7 @@ class MultiCopyMerger:
                         type_label_map = {
                             'delete': '删除', 'insert': '新增',
                             'modify': '修改', 'table': '表格修改',
+                            'sdt': '内容控件修改',
                             'table_insert': '表格新增', 'table_delete': '表格删除',
                         }
                         type_label = type_label_map.get(change.change_type, change.change_type.upper())

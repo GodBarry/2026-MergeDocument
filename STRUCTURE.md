@@ -6,6 +6,8 @@ mddm/
   merge_gui.py                桌面界面
   run_merge.py                命令行入口与任务输出
   multi_copy_merger.py        DOCX 比对、冲突检测与合稿写回
+  word_comments.py            人工批注、选区及回复关系
+  output_batch.py             合稿及报告的批次写入和恢复
   anchor_engine.py            文本锚点辅助
   numbering_resolver.py       Word 自动编号解析
   heading_processor.py        标题识别与编号处理
@@ -19,8 +21,9 @@ mddm/
   logging_config.py           日志配置
   resources/                  公式转换样式表与 Ruby 桥接脚本
 tests/                        自动化回归测试
-docs/                         部署说明
+docs/                         部署说明和软件设计说明书
 packaging/windows/            Windows 分发启动脚本和说明
+releases/                     已验收的工程部署包
 pyproject.toml                包配置、依赖和安装入口
 requirements.txt              核心依赖
 setup_env.py / setup_env.ps1  环境安装辅助脚本
