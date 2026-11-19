@@ -119,6 +119,109 @@ def _wptag(n): return f'{{{WP}}}{n}'
 def _wpeqtag(n): return f'{{{WPC}}}{n}'
 
 
+_RUN_CONTAINERS = {
+    _wtag(name) for name in ('hyperlink', 'ins', 'moveTo', 'fldSimple', 'smartTag',
+                            'customXml', 'sdt', 'sdtContent')
+}
+_REVISION_TAGS = {
+    _wtag(name) for name in ('ins', 'del', 'moveFrom', 'moveTo',
+                            'pPrChange', 'rPrChange', 'sectPrChange', 'numberingChange')
+}
+_MOVE_RANGE_TAGS = {
+    _wtag(name) for name in ('moveFromRangeStart', 'moveFromRangeEnd',
+                            'moveToRangeStart', 'moveToRangeEnd')
+}
+_REVISION_MARKUP = _REVISION_TAGS | _MOVE_RANGE_TAGS
+_IGNORED_PARAGRAPH_TAGS = {
+    _wtag(name) for name in ('proofErr', 'commentRangeStart', 'commentRangeEnd', 'commentReference')
+}
+_IGNORED_PARAGRAPH_ATTRIBUTES = {
+    '{http://www.w3.org/XML/1998/namespace}space',
+    '{http://schemas.microsoft.com/office/word/2010/wordml}paraId',
+    '{http://schemas.microsoft.com/office/word/2010/wordml}textId',
+    '{http://schemas.microsoft.com/office/word/2010/wordprocessingDrawing}anchorId',
+    '{http://schemas.microsoft.com/office/word/2010/wordprocessingDrawing}editId',
+}
+
+
+def _visible_runs(element):
+    for child in element:
+        if child.tag == _wtag('r'):
+            yield child
+        elif child.tag in _RUN_CONTAINERS:
+            yield from _visible_runs(child)
+
+
+def _relationship_attribute(name):
+    return name.startswith(f'{{{R}}}') or name == '{urn:schemas-microsoft-com:office:office}relid'
+
+
+def _relationship_signatures(package):
+    rels_path = 'word/_rels/document.xml.rels'
+    if rels_path not in package.namelist():
+        return {}
+
+    signatures = {}
+    image_digests = {}
+    for rel in _safe_xml_from_zip(package, rels_path):
+        rel_type = rel.get('Type', '')
+        mode = rel.get('TargetMode', 'Internal')
+        target = rel.get('Target', '')
+        if mode == 'Internal' and rel_type.endswith('/image'):
+            part = posixpath.normpath(posixpath.join('/word', target)).lstrip('/')
+            if part not in image_digests:
+                try:
+                    with package.open(part) as stream:
+                        digest = hashlib.sha256()
+                        for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+                            digest.update(chunk)
+                        image_digests[part] = digest.hexdigest()
+                except KeyError:
+                    # Unreferenced legacy relationships may be stale; copying a missing image still fails.
+                    image_digests[part] = ('missing', part)
+            target = image_digests[part]
+        signatures[rel.get('Id')] = (rel_type, mode, target)
+    return signatures
+
+
+def _paragraph_signature(element, relationships):
+    """Compare paragraph content independently of Word's local IDs and simple run boundaries."""
+    attributes = tuple(
+        (name, relationships.get(value, value) if _relationship_attribute(name) else value)
+        for name, value in sorted(element.attrib.items())
+        if not name.startswith(_wtag('rsid'))
+        and name not in _IGNORED_PARAGRAPH_ATTRIBUTES
+        and not (name == _wtag('id') and element.tag in _REVISION_MARKUP)
+        and not (name == 'id' and element.tag in (_wptag('docPr'), '{http://schemas.openxmlformats.org/drawingml/2006/picture}cNvPr'))
+    )
+    children = []
+    for child in element:
+        if not isinstance(child.tag, str) or child.tag in _IGNORED_PARAGRAPH_TAGS:
+            continue
+        part = _paragraph_signature(child, relationships)
+        if child.tag in (_wtag('pPr'), _wtag('rPr')) and not any(part[1:]):
+            continue
+        if child.tag == _wtag('r'):
+            run_children = part[3]
+            if not run_children:
+                continue
+            if (
+                (len(run_children) == 1 or len(run_children) == 2 and run_children[0][0] == _wtag('rPr'))
+                and run_children[-1][0] == _wtag('t')
+                and not run_children[-1][3]
+            ):
+                run_style = (part[1], run_children[:-1])
+                text = run_children[-1][2]
+                if children and children[-1][0] == 'text-run' and children[-1][1] == run_style:
+                    text = children.pop()[2] + text
+                part = ('text-run', run_style, text)
+        children.append(part)
+    text = element.text or ''
+    if element.tag not in (_wtag('t'), _wtag('delText'), _wtag('instrText'), _wtag('delInstrText')) and not text.strip():
+        text = ''
+    return element.tag, attributes, text, tuple(children)
+
+
 def _safe_xml_from_zip(zf: zipfile.ZipFile, xml_path: str) -> etree._Element:
     """
     从 ZIP 文件流安全解析 XML，处理以下常见问题：
@@ -172,7 +275,7 @@ class DocItem:
         'index', 'type', 'content', 'item_id', 'xml',
         'para_props', 'runs', 'images', 'rows', 'table_props',
         'heading_score', 'style_name', 'page',
-        'level', 'detected_level', 'body_tag',
+        'level', 'detected_level', 'body_tag', 'paragraph_signature',
     )
     def __init__(self):
         self.index: int = 0
@@ -191,6 +294,7 @@ class DocItem:
         self.level: str = '?'          # 原判级别 (从样式提取，如 '1', '?' )
         self.detected_level: int = 0   # 推断级别 (0=正文, 1=1级...)
         self.body_tag: str = ''   # body 子元素标签名
+        self.paragraph_signature = None
 
     def table_shape(self) -> tuple:
         return tuple(tuple((cell['rowspan'], cell['colspan']) for cell in row) for row in self.rows)
@@ -242,6 +346,7 @@ class OpenXMLDocumentEngine:
 
                 doc_root = _safe_xml_from_zip(zf, 'word/document.xml')
                 body = doc_root.find(_wtag('body'))
+                relationships = _relationship_signatures(zf)
 
             if doc_root.tag != _wtag('document') or body is None:
                 raise ValueError("缺少有效的 Word 正文")
@@ -272,26 +377,15 @@ class OpenXMLDocumentEngine:
 
                 if tag == 'p':
                     # 段落：提取详细内容
-                    item = self._extract_para_item(
-                        child, para_counter, image_counter, style_map, doc_path, nr=nr)
+                    item = self._extract_para_item(child, style_map, nr=nr)
+                    item.paragraph_signature = _paragraph_signature(child, relationships)
                     para_counter += 1
                     item.body_tag = 'p'
                     items.append(item)
                     item.index = len(items) - 1
 
-                    # 内嵌图片拆为独立块（图片也属于 body 子元素层级）
-                    for img_info in item.images:
-                        img_item = DocItem()
-                        img_item.type = 'image'
-                        img_item.item_id = img_info['item_id']
-                        img_item.content = f"[图片{image_counter}]"
-                        img_item.xml = img_info['xml']
-                        img_item.style_name = ''
-                        img_item.page = item.page
-                        img_item.body_tag = 'drawing'
-                        items.append(img_item)
-                        img_item.index = len(items) - 1
-                        image_counter += 1
+                    # 图片由所属段落写回，避免为同一图片额外生成正文占位符。
+                    image_counter += len(item.images)
 
                     # 页码估算
                     chars_on_page += len(item.content) + 50
@@ -327,7 +421,7 @@ class OpenXMLDocumentEngine:
                     items.append(item)
                     item.index = len(items) - 1
 
-            print(f"    [OK] 成功提取: {para_counter} 个段落, {table_counter} 个表格, {image_counter} 个图片, {len(items) - para_counter - table_counter - image_counter} 个其他元素")
+            print(f"    [OK] 成功提取: {para_counter} 个段落, {table_counter} 个表格, {image_counter} 个图片, {len(items) - para_counter - table_counter} 个其他元素")
 
             return {
                 'items': items,
@@ -442,11 +536,7 @@ class OpenXMLDocumentEngine:
             pass
         return styles
 
-    def _extract_para_item(self, para: etree._Element,
-                           para_idx: int,
-                           image_idx: int,
-                           style_map: Dict,
-                           doc_path: str,
+    def _extract_para_item(self, para: etree._Element, style_map: Dict,
                            nr: NumberingResolver = None) -> DocItem:
         item = DocItem()
         item.index = -1  # 临时，后续填充
@@ -480,7 +570,7 @@ class OpenXMLDocumentEngine:
         images = []
         cur_bold = style_bold
 
-        for run in para.findall(_wtag('r')):
+        for run in _visible_runs(para):
             rPr = run.find(_wtag('rPr'))
             run_bold = cur_bold
             run_font = style_font
@@ -517,14 +607,11 @@ class OpenXMLDocumentEngine:
                 if color_el is not None:
                     run_color = color_el.get(_wtag('val'), '')
 
-            t_el = run.find(_wtag('t'))
-            drawing = run.find(_wtag('drawing'))
-            pict = run.find(_wtag('pict'))
-
-            if t_el is not None and t_el.text:
-                text_parts.append(t_el.text)
+            text = ''.join(node.text or '' for node in run.findall(_wtag('t')))
+            if text:
+                text_parts.append(text)
                 runs.append({
-                    'text': t_el.text,
+                    'text': text,
                     'bold': run_bold,
                     'italic': run_italic,
                     'underline': run_underline,
@@ -533,19 +620,10 @@ class OpenXMLDocumentEngine:
                     'fontSize': run_size,
                     'background': '',
                 })
-            else:
-                # 图片
-                ref = drawing if drawing is not None else pict
-                if ref is not None:
-                    embed_id = self._get_embed_id(ref)
-                    img_item_id = hashlib.md5(
-                        f"{embed_id}|img".encode()).hexdigest()[:16]
-                    images.append({
-                        'embed_id': embed_id,
-                        'item_id': img_item_id,
-                        'xml': ref,
-                    })
-                    text_parts.append(f"[图片{len(images)-1}]")
+            for child in run:
+                if child.tag in (_wtag('drawing'), _wtag('pict')):
+                    text_parts.append(f"[图片{len(images)}]")
+                    images.append(child)
 
         # 合并单元格内容
         for mcg in para.findall(_wtag('mc')):
@@ -753,19 +831,6 @@ class OpenXMLDocumentEngine:
     # ------------------------------------------------------------------
     # 辅助方法
     # ------------------------------------------------------------------
-    def _get_embed_id(self, element: etree._Element) -> str:
-        for el in element.iter():
-            tag = el.tag.split('}')[-1] if '}' in el.tag else el.tag
-            if tag in ('blip', 'image'):
-                for attr in ('{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed',
-                             'r:embed', 'embed'):
-                    if attr in el.attrib:
-                        return el.attrib[attr]
-        return ''
-
-    # ------------------------------------------------------------------
-    # 合并（纯 XML 写回）
-    # ------------------------------------------------------------------
     def merge_documents_with_revisions(
         self, base_doc: str, copies: List[Tuple[str, str]],
         output: str, changes: List[DocumentChange] = None,
@@ -778,6 +843,7 @@ class OpenXMLDocumentEngine:
         """
         print(f"    [合并] 使用纯 XML 引擎合并...")
         self._replaced_positions = set()
+        self._move_revision_ids = {}
 
         if os.path.exists(output):
             input_paths = [base_doc, *(path for path, _ in copies)]
@@ -818,6 +884,15 @@ class OpenXMLDocumentEngine:
             doc_tree = etree.parse(doc_xml_path, parser)
             doc_root = doc_tree.getroot()
             body = doc_root.find(_wtag('body'))
+            revision_ids = (
+                int(value) for node in body.iter()
+                if node.tag in _REVISION_MARKUP
+                for value in [node.get(_wtag('id'), '')] if value.isdecimal()
+            )
+            self._next_revision_id = max(revision_ids, default=-1) + 1
+            drawing_ids = (int(node.get('id')) for node in body.iter(_wptag('docPr'))
+                           if node.get('id', '').isdecimal())
+            self._next_drawing_id = max(drawing_ids, default=0) + 1
 
             # 解析现有评论 ID 确保唯一性
             comments_path = os.path.join(extract_dir, 'word', 'comments.xml')
@@ -1027,6 +1102,27 @@ class OpenXMLDocumentEngine:
                 clr = etree.SubElement(rPr, _wtag('color'))
             clr.set(_wtag('val'), color)
 
+    def _assign_copy_local_ids(self, element, copy_index):
+        """Assign fresh drawing and revision identifiers to imported markup."""
+        for node in element.iter():
+            if node.tag == _wptag('docPr') and node.get('id') is not None:
+                node.set('id', str(self._next_drawing_id))
+                self._next_drawing_id += 1
+
+            old_id = node.get(_wtag('id'))
+            if old_id is None or node.tag not in _REVISION_MARKUP:
+                continue
+            if node.tag in _MOVE_RANGE_TAGS:
+                group = node.tag[:-5] if node.tag.endswith('Start') else node.tag[:-3]
+                key = (copy_index, group, old_id)
+                new_id = self._move_revision_ids.get(key)
+                if new_id is not None:
+                    node.set(_wtag('id'), new_id)
+                    continue
+                self._move_revision_ids[key] = str(self._next_revision_id)
+            node.set(_wtag('id'), str(self._next_revision_id))
+            self._next_revision_id += 1
+
     def _apply_para_modify(self, body: etree._Element,
                             blocks: List[etree._Element],
                             pos: int,
@@ -1053,6 +1149,7 @@ class OpenXMLDocumentEngine:
                 new_content = diff_data.get('new_content', '')
                 new_para = self._mark_diff_runs_in_copy_para(
                     copy_para_xml, old_content, new_content, color)
+                self._assign_copy_local_ids(new_para, change.copy_index)
                 if extract_dir and copy_path:
                     self._clone_relationships_and_media(new_para, copy_path, extract_dir)
             else:
@@ -1188,7 +1285,12 @@ class OpenXMLDocumentEngine:
             t.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
             t.text = new_content
 
-        if not old_content or not new_content:
+        if old_content == new_content or not old_content or not new_content:
+            return para_el
+        if any(
+            node.tag in _REVISION_MARKUP or any(_relationship_attribute(name) for name in node.attrib)
+            for node in para_el.iter()
+        ):
             return para_el
 
         # 字符级 diff，找出哪些位置有差异
@@ -1232,14 +1334,15 @@ class OpenXMLDocumentEngine:
                 if ov_start < ov_end:
                     overlaps.append((ov_start - r_start, ov_end - r_start))  # 转为 run 内偏移
 
-            if not overlaps:
-                continue  # 此 run 无差异，保持原样
+            if not overlaps or any(child.tag not in (_wtag('rPr'), _wtag('t')) for child in run):
+                continue
 
             # 整个 run 都是差异 → 直接标色，无需拆分
             if len(overlaps) == 1 and overlaps[0][0] == 0 and overlaps[0][1] == len(rt):
                 rPr = run.find(_wtag('rPr'))
                 if rPr is None:
-                    rPr = etree.SubElement(run, _wtag('rPr'))
+                    rPr = etree.Element(_wtag('rPr'))
+                    run.insert(0, rPr)
                 color_el = rPr.find(_wtag('color'))
                 if color_el is None:
                     color_el = etree.SubElement(rPr, _wtag('color'))
@@ -1402,9 +1505,8 @@ class OpenXMLDocumentEngine:
         nodes_with_rids = []
         for node in elem.iter():
             for attr_name, attr_val in node.attrib.items():
-                if attr_val.startswith('rId'):
-                    if 'embed' in attr_name.lower() or 'id' in attr_name.lower():
-                        nodes_with_rids.append((node, attr_name, attr_val))
+                if _relationship_attribute(attr_name):
+                    nodes_with_rids.append((node, attr_name, attr_val))
 
         if not nodes_with_rids:
             return
@@ -1469,7 +1571,7 @@ class OpenXMLDocumentEngine:
                             break
                     
                     if source_rel is None:
-                        continue
+                        raise ValueError(f"副本缺少资源关系: {old_rid}")
                         
                     target_path_relative = source_rel.get('Target')
                     rel_type = source_rel.get('Type')
@@ -1585,6 +1687,7 @@ class OpenXMLDocumentEngine:
         
         if xml_str:
             new_parsed_el = etree.fromstring(xml_str.encode('utf-8'))
+            self._assign_copy_local_ids(new_parsed_el, change.copy_index)
             if extract_dir and copy_path:
                 self._clone_relationships_and_media(new_parsed_el, copy_path, extract_dir)
 
@@ -2419,8 +2522,7 @@ class MultiCopyMerger:
             o_idx = o_anchor['item_index']
             c_idx = c_anchor['item_index']
 
-            # 锚点本身可能有文本变化 → 视为修改
-            if o_anchor['content'] != c_anchor['content']:
+            if self.orig_items[o_idx].paragraph_signature != copy_items[c_idx].paragraph_signature:
                 changes.extend(self._make_replace_change(
                     self.orig_items[o_idx], copy_items[c_idx], c_idx, author, author_idx
                 ))
@@ -2654,7 +2756,9 @@ class MultiCopyMerger:
         changes = []
         for tag, o_start, o_end, c_start, c_end in matcher.get_opcodes():
             if tag == 'equal':
-                continue
+                for original, copy in zip(orig_items[o_start:o_end], copy_items[c_start:c_end]):
+                    if original.paragraph_signature != copy.paragraph_signature:
+                        changes.extend(self._make_replace_change(original, copy, original.index, author, copy_index))
             elif tag == 'replace':
                 replace_len = min(o_end - o_start, c_end - c_start)
                 for i in range(replace_len):
@@ -3308,7 +3412,9 @@ class MultiCopyMerger:
         
         for tag, o_start, o_end, c_start, c_end in opcodes:
             if tag == 'equal':
-                continue
+                for original, copy in zip(orig_block[o_start:o_end], copy_block[c_start:c_end]):
+                    if original.paragraph_signature != copy.paragraph_signature:
+                        changes.extend(self._make_replace_change(original, copy, original.index, author, copy_index))
 
             elif tag == 'replace':
                 # 记录相匹配的替换区间长度
